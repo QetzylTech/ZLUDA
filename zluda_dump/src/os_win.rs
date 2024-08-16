@@ -10,8 +10,6 @@ use winapi::{
     um::libloaderapi::{GetProcAddress, LoadLibraryW},
 };
 
-use cuda_types::CUuuid;
-
 pub(crate) const LIBCUDA_DEFAULT_PATH: &'static str = "C:\\Windows\\System32\\nvcuda.dll";
 const LOAD_LIBRARY_NO_REDIRECT: &'static [u8] = b"ZludaLoadLibraryW_NoRedirect\0";
 const GET_PROC_ADDRESS_NO_REDIRECT: &'static [u8] = b"ZludaGetProcAddress_NoRedirect\0";
@@ -116,8 +114,8 @@ pub fn __log_impl(s: String) {
 #[cfg(target_arch = "x86")]
 pub fn get_thunk(
     original_fn: *const c_void,
-    report_fn: unsafe extern "system" fn(*const CUuuid, usize),
-    guid: *const CUuuid,
+    report_fn: unsafe extern "system" fn(*const [u8; 16], usize),
+    guid: *const [u8; 16],
     idx: usize,
 ) -> *const c_void {
     use dynasmrt::{dynasm, DynasmApi};
@@ -143,33 +141,46 @@ pub fn get_thunk(
 #[cfg(target_arch = "x86_64")]
 pub fn get_thunk(
     original_fn: *const c_void,
-    report_fn: unsafe extern "system" fn(*const CUuuid, usize),
-    guid: *const CUuuid,
+    report_fn: unsafe extern "system" fn(*const [u8; 16], usize),
+    guid: *const [u8; 16],
     idx: usize,
 ) -> *const c_void {
     use dynasmrt::{dynasm, DynasmApi};
     let mut ops = dynasmrt::x86::Assembler::new().unwrap();
     let start = ops.offset();
-    // Let's hope there's never more than 4 arguments
     dynasm!(ops
         ; .arch x64
-        ; push rbp
-        ; mov rbp, rsp
-        ; push rcx
-        ; push rdx
-        ; push r8
-        ; push r9
+        ; mov [rsp+0x20], r9
+        ; mov [rsp+0x18], r8
+        ; mov [rsp+0x10], rdx
+        ; mov [rsp+0x08], rcx
+        // 0x20 for shadow space, 0x38 for 7 stack args, aligns to 16 bytes
+        ; sub rsp, 0x58
         ; mov rcx, QWORD guid as i64
         ; mov rdx, QWORD idx as i64
         ; mov rax, QWORD report_fn as i64
         ; call rax
-        ; pop r9
-        ; pop r8
-        ; pop rdx
-        ; pop rcx
+        ; mov rax, [rsp+0x58+0x58]
+        ; mov [rsp+0x50], rax
+        ; mov rax, [rsp+0x50+0x58]
+        ; mov [rsp+0x48], rax
+        ; mov rax, [rsp+0x48+0x58]
+        ; mov [rsp+0x40], rax
+        ; mov rax, [rsp+0x40+0x58]
+        ; mov [rsp+0x38], rax
+        ; mov rax, [rsp+0x38+0x58]
+        ; mov [rsp+0x30], rax
+        ; mov rax, [rsp+0x30+0x58]
+        ; mov [rsp+0x28], rax
+        ; mov rax, [rsp+0x28+0x58]
+        ; mov [rsp+0x20], rax
+        ; mov r9,  [rsp+0x20+0x58]
+        ; mov r8,  [rsp+0x18+0x58]
+        ; mov rdx, [rsp+0x10+0x58]
+        ; mov rcx, [rsp+0x08+0x58]
         ; mov rax, QWORD original_fn as i64
         ; call rax
-        ; pop rbp
+        ; add rsp, 0x58
         ; ret
         ; int 3
     );

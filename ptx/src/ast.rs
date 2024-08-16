@@ -1,5 +1,6 @@
 use half::f16;
 use lalrpop_util::{lexer::Token, ParseError};
+use std::alloc::Layout;
 use std::{convert::From, mem, num::ParseFloatError, str::FromStr};
 use std::{marker::PhantomData, num::ParseIntError};
 
@@ -28,19 +29,31 @@ pub enum PtxError {
     #[error("")]
     ZeroDimensionArray,
     #[error("")]
-    ArrayInitalizer,
+    ArrayInitializer,
+    #[error("")]
+    ScalarInitalizer,
+    #[error("")]
+    NonScalarArray,
+    #[error("")]
+    InvalidStateSpace,
+    #[error("")]
+    BlankVariableName,
+    #[error("")]
+    NonRegPredVariable,
+    #[error("")]
+    InitializerTypeMismatch,
     #[error("")]
     NonExternPointer,
     #[error("{start}:{end}")]
-    UnrecognizedStatement {
-        start: usize,
-        end: usize,
-    },
+    UnrecognizedStatement { start: usize, end: usize },
     #[error("{start}:{end}")]
-    UnrecognizedDirective {
-        start: usize,
-        end: usize,
-    },
+    UnrecognizedDirective { start: usize, end: usize },
+    #[error("")]
+    NoSmVersion,
+    #[error("")]
+    UnexpectedMultivariable,
+    #[error("")]
+    ExternDefinition,
 }
 
 // For some weird reson this is illegal:
@@ -53,6 +66,13 @@ pub enum PtxError {
 #[derive(Copy, Clone, Eq, PartialEq)]
 pub enum BarDetails {
     SyncAligned,
+}
+
+#[derive(Eq, PartialEq, Clone, Copy)]
+pub enum ReductionOp {
+    And,
+    Or,
+    Popc,
 }
 
 pub trait UnwrapWithVec<E, To> {
@@ -87,12 +107,12 @@ impl<
 }
 
 pub struct Module<'a> {
-    pub version: (u8, u8),
+    pub sm_version: u32,
     pub directives: Vec<Directive<'a, ParsedArgParams<'a>>>,
 }
 
 pub enum Directive<'a, P: ArgParams> {
-    Variable(LinkingDirective, Variable<P::Id>),
+    Variable(LinkingDirective, MultiVariableDefinition<P::Id>),
     Method(LinkingDirective, Function<'a, &'a str, Statement<P>>),
 }
 
@@ -102,11 +122,20 @@ pub enum MethodName<'input, ID> {
     Func(ID),
 }
 
+impl<'input, ID> MethodName<'input, ID> {
+    pub fn is_kernel(&self) -> bool {
+        match self {
+            MethodName::Kernel(..) => true,
+            MethodName::Func(..) => false,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct MethodDeclaration<'input, ID> {
-    pub return_arguments: Vec<Variable<ID>>,
+    pub return_arguments: Vec<VariableDeclaration<ID>>,
     pub name: MethodName<'input, ID>,
-    pub input_arguments: Vec<Variable<ID>>,
-    pub shared_mem: Option<ID>,
+    pub input_arguments: Vec<VariableDeclaration<ID>>,
 }
 
 pub struct Function<'a, ID, S> {
@@ -115,9 +144,7 @@ pub struct Function<'a, ID, S> {
     pub body: Option<Vec<S>>,
 }
 
-pub type ParsedFunction<'a> = Function<'a, &'a str, Statement<ParsedArgParams<'a>>>;
-
-#[derive(PartialEq, Eq, Clone)]
+#[derive(PartialEq, Eq, Clone, Hash)]
 pub enum Type {
     // .param.b32 foo;
     // -> OpTypeInt
@@ -162,6 +189,10 @@ pub enum Type {
     // .reg ptr<.b64.param>
     // -> OpTypePointer Function
     Pointer(ScalarType, StateSpace),
+    Texref,
+    Surfref,
+    // Structs exist only to support certain internal, compiler-generated patterns
+    Struct(Vec<StructField>),
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Copy)]
@@ -183,6 +214,30 @@ pub enum ScalarType {
     F64,
     F16x2,
     Pred,
+}
+
+impl ScalarType {
+    pub(crate) fn to_ptx_name(self) -> &'static str {
+        match self {
+            ScalarType::B8 => "b8",
+            ScalarType::B16 => "b16",
+            ScalarType::B32 => "b32",
+            ScalarType::B64 => "b64",
+            ScalarType::U8 => "u8",
+            ScalarType::U16 => "u16",
+            ScalarType::U32 => "u32",
+            ScalarType::U64 => "u64",
+            ScalarType::S8 => "s8",
+            ScalarType::S16 => "s16",
+            ScalarType::S32 => "s32",
+            ScalarType::S64 => "s64",
+            ScalarType::F16 => "f16",
+            ScalarType::F32 => "f32",
+            ScalarType::F64 => "f64",
+            ScalarType::F16x2 => "f16x2",
+            ScalarType::Pred => "pred",
+        }
+    }
 }
 
 impl ScalarType {
@@ -215,28 +270,67 @@ impl Default for ScalarType {
     }
 }
 
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub enum StructField {
+    Scalar(ScalarType),
+    Vector(ScalarType, u8),
+}
+
+impl StructField {
+    pub fn to_type(self) -> Type {
+        match self {
+            Self::Scalar(type_) => Type::Scalar(type_),
+            Self::Vector(type_, size) => Type::Vector(type_, size),
+        }
+    }
+}
+
 pub enum Statement<P: ArgParams> {
     Label(P::Id),
-    Variable(MultiVariable<P::Id>),
+    Callprototype(Callprototype<P::Id>),
+    Variable(Vec<MultiVariableDefinition<P::Id>>),
     Instruction(Option<PredAt<P::Id>>, Instruction<P>),
     Block(Vec<Statement<P>>),
 }
 
-pub struct MultiVariable<ID> {
-    pub var: Variable<ID>,
-    pub count: Option<u32>,
+#[derive(Clone)]
+pub struct Callprototype<ID> {
+    pub name: ID,
+    pub return_arguments: Vec<(Type, StateSpace)>,
+    pub input_arguments: Vec<(Type, StateSpace)>,
 }
 
 #[derive(Clone)]
-pub struct Variable<ID> {
+pub struct VariableDeclaration<ID> {
     pub align: Option<u32>,
-    pub v_type: Type,
+    pub type_: Type,
     pub state_space: StateSpace,
     pub name: ID,
-    pub array_init: Vec<u8>,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+impl<ID> VariableDeclaration<ID> {
+    pub fn layout(&self) -> Layout {
+        let layout = self.type_.layout();
+        match self.align.map(|a| layout.align_to(a as usize)) {
+            Some(Ok(aligned_layout)) => aligned_layout,
+            _ => layout,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct MultiVariableDefinition<ID> {
+    pub variable: VariableDeclaration<ID>,
+    pub suffix: Option<DeclarationSuffix<ID>>,
+}
+
+#[derive(Clone)]
+pub enum DeclarationSuffix<ID> {
+    Count(u32),
+    Initializer(Initializer<ID>),
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum StateSpace {
     Reg,
     Const,
@@ -253,11 +347,18 @@ pub struct PredAt<ID> {
     pub label: ID,
 }
 
+pub struct BfindDetails {
+    pub shift: bool,
+    pub type_: ScalarType,
+}
+
 pub enum Instruction<P: ArgParams> {
     Ld(LdDetails, Arg2Ld<P>),
     Mov(MovDetails, Arg2Mov<P>),
     Mul(MulDetails, Arg3<P>),
     Add(ArithDetails, Arg3<P>),
+    AddC(CarryInDetails, Arg3<P>),
+    AddCC(ScalarType, Arg3<P>),
     Setp(SetpData, Arg4Setp<P>),
     SetpBool(SetpBoolData, Arg5Setp<P>),
     Not(ScalarType, Arg2<P>),
@@ -271,35 +372,141 @@ pub enum Instruction<P: ArgParams> {
     Call(CallInst<P>),
     Abs(AbsDetails, Arg2<P>),
     Mad(MulDetails, Arg4<P>),
+    MadC {
+        type_: ScalarType,
+        carry_out: bool,
+        is_hi: bool,
+        arg: Arg4<P>,
+    },
+    MadCC {
+        type_: ScalarType,
+        is_hi: bool,
+        arg: Arg4<P>,
+    },
     Fma(ArithFloat, Arg4<P>),
     Or(ScalarType, Arg3<P>),
     Sub(ArithDetails, Arg3<P>),
+    SubC(CarryInDetails, Arg3<P>),
+    SubCC(ScalarType, Arg3<P>),
     Min(MinMaxDetails, Arg3<P>),
     Max(MinMaxDetails, Arg3<P>),
-    Rcp(RcpDetails, Arg2<P>),
+    Rcp(RcpSqrtDetails, Arg2<P>),
+    Sqrt(RcpSqrtDetails, Arg2<P>),
     And(ScalarType, Arg3<P>),
     Selp(ScalarType, Arg4<P>),
     Bar(BarDetails, Arg1Bar<P>),
+    BarWarp(BarDetails, Arg1Bar<P>),
+    BarRed(ReductionOp, Arg3<P>),
     Atom(AtomDetails, Arg3<P>),
     AtomCas(AtomCasDetails, Arg4<P>),
     Div(DivDetails, Arg3<P>),
-    Sqrt(SqrtDetails, Arg2<P>),
     Rsqrt(RsqrtDetails, Arg2<P>),
     Neg(NegDetails, Arg2<P>),
-    Sin { flush_to_zero: bool, arg: Arg2<P> },
-    Cos { flush_to_zero: bool, arg: Arg2<P> },
-    Lg2 { flush_to_zero: bool, arg: Arg2<P> },
-    Ex2 { flush_to_zero: bool, arg: Arg2<P> },
-    Clz { typ: ScalarType, arg: Arg2<P> },
-    Brev { typ: ScalarType, arg: Arg2<P> },
-    Popc { typ: ScalarType, arg: Arg2<P> },
-    Xor { typ: ScalarType, arg: Arg3<P> },
-    Bfe { typ: ScalarType, arg: Arg4<P> },
-    Bfi { typ: ScalarType, arg: Arg5<P> },
-    Rem { typ: ScalarType, arg: Arg3<P> },
-    Prmt { control: u16, arg: Arg3<P> },
-    Activemask { arg: Arg1<P> },
-    Membar { level: MemScope },
+    Sin {
+        flush_to_zero: bool,
+        arg: Arg2<P>,
+    },
+    Cos {
+        flush_to_zero: bool,
+        arg: Arg2<P>,
+    },
+    Lg2 {
+        flush_to_zero: bool,
+        arg: Arg2<P>,
+    },
+    Ex2 {
+        flush_to_zero: bool,
+        arg: Arg2<P>,
+    },
+    Clz {
+        typ: ScalarType,
+        arg: Arg2<P>,
+    },
+    Brev {
+        typ: ScalarType,
+        arg: Arg2<P>,
+    },
+    Popc {
+        typ: ScalarType,
+        arg: Arg2<P>,
+    },
+    Xor {
+        typ: ScalarType,
+        arg: Arg3<P>,
+    },
+    Bfe {
+        typ: ScalarType,
+        arg: Arg4<P>,
+    },
+    Bfi {
+        typ: ScalarType,
+        arg: Arg5<P>,
+    },
+    Rem {
+        typ: ScalarType,
+        arg: Arg3<P>,
+    },
+    Prmt {
+        control: u16,
+        arg: Arg3<P>,
+    },
+    PrmtSlow {
+        control: P::Id,
+        arg: Arg3<P>,
+    },
+    Activemask {
+        arg: Arg1<P>,
+    },
+    Membar {
+        level: MemScope,
+    },
+    Tex(TexDetails, Arg5Tex<P>),
+    Suld(SurfaceDetails, Arg5Tex<P>),
+    Sust(SurfaceDetails, Arg4Sust<P>),
+    Shfl(ShflMode, Arg5Shfl<P>),
+    Shf(FunnelShift, Arg4<P>),
+    Vote(VoteDetails, Arg3<P>),
+    Exit,
+    Trap,
+    Brkpt,
+    Vshr(Arg4<P>),
+    Bfind(BfindDetails, Arg2<P>),
+    Set(SetData, Arg3<P>),
+    Dp4a(ScalarType, Arg4<P>),
+    MatchAny(Arg3<P>),
+    Red(AtomDetails, Arg2St<P>),
+    Nanosleep(Arg1<P>),
+    Isspacep(StateSpace, Arg2<P>),
+    Sad(ScalarType, Arg4<P>),
+}
+
+#[derive(Copy, Clone)]
+
+pub struct CarryInDetails {
+    pub type_: ScalarType,
+    pub carry_out: bool,
+}
+
+#[derive(Copy, Clone)]
+pub enum ShflMode {
+    Up,
+    Down,
+    Bfly,
+    Idx,
+}
+
+#[derive(Copy, Clone)]
+pub struct VoteDetails {
+    pub mode: VoteMode,
+    pub negate_pred: bool,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum VoteMode {
+    Ballot,
+    All,
+    Any,
+    Uni,
 }
 
 #[derive(Copy, Clone)]
@@ -310,11 +517,36 @@ pub struct AbsDetails {
     pub flush_to_zero: Option<bool>,
     pub typ: ScalarType,
 }
+
 #[derive(Copy, Clone)]
-pub struct RcpDetails {
-    pub rounding: Option<RoundingMode>,
+pub struct RcpSqrtDetails {
+    pub kind: RcpSqrtKind,
     pub flush_to_zero: Option<bool>,
-    pub is_f64: bool,
+    pub type_: ScalarType,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum RcpSqrtKind {
+    Approx,
+    Rounding(RoundingMode),
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub struct FunnelShift {
+    pub direction: FunnelDirection,
+    pub mode: ShiftNormalization,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum FunnelDirection {
+    Left,
+    Right,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum ShiftNormalization {
+    Wrap,
+    Clamp,
 }
 
 pub struct CallInst<P: ArgParams> {
@@ -322,6 +554,7 @@ pub struct CallInst<P: ArgParams> {
     pub ret_params: Vec<P::Id>,
     pub func: P::Id,
     pub param_list: Vec<P::Operand>,
+    pub prototype: Option<P::Id>,
 }
 
 pub trait ArgParams {
@@ -385,6 +618,13 @@ pub struct Arg4Setp<P: ArgParams> {
     pub src2: P::Operand,
 }
 
+pub struct Arg4Sust<P: ArgParams> {
+    pub image: P::Operand,
+    pub coordinates: P::Operand,
+    pub layer: Option<P::Operand>,
+    pub value: P::Operand,
+}
+
 pub struct Arg5<P: ArgParams> {
     pub dst: P::Operand,
     pub src1: P::Operand,
@@ -393,7 +633,23 @@ pub struct Arg5<P: ArgParams> {
     pub src4: P::Operand,
 }
 
+pub struct Arg5Tex<P: ArgParams> {
+    pub dst: P::Operand,
+    pub image: P::Operand,
+    pub layer: Option<P::Operand>,
+    pub coordinates: P::Operand,
+    pub lod: Option<P::Operand>,
+}
+
 pub struct Arg5Setp<P: ArgParams> {
+    pub dst1: P::Id,
+    pub dst2: Option<P::Id>,
+    pub src1: P::Operand,
+    pub src2: P::Operand,
+    pub src3: P::Operand,
+}
+
+pub struct Arg5Shfl<P: ArgParams> {
     pub dst1: P::Id,
     pub dst2: Option<P::Id>,
     pub src1: P::Operand,
@@ -409,18 +665,109 @@ pub enum ImmediateValue {
     F64(f64),
 }
 
+impl ImmediateValue {
+    pub fn to_bytes(self) -> Vec<u8> {
+        match self {
+            ImmediateValue::U64(x) => x.to_ne_bytes().to_vec(),
+            ImmediateValue::S64(x) => x.to_ne_bytes().to_vec(),
+            ImmediateValue::F32(x) => x.to_ne_bytes().to_vec(),
+            ImmediateValue::F64(x) => x.to_ne_bytes().to_vec(),
+        }
+    }
+
+    pub fn as_u8(self) -> Option<u8> {
+        match self {
+            ImmediateValue::U64(x) => Some(x as u8),
+            ImmediateValue::S64(x) => Some(x as u8),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_i8(self) -> Option<i8> {
+        match self {
+            ImmediateValue::U64(x) => Some(x as i8),
+            ImmediateValue::S64(x) => Some(x as i8),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_u16(self) -> Option<u16> {
+        match self {
+            ImmediateValue::U64(x) => Some(x as u16),
+            ImmediateValue::S64(x) => Some(x as u16),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_i16(self) -> Option<i16> {
+        match self {
+            ImmediateValue::U64(x) => Some(x as i16),
+            ImmediateValue::S64(x) => Some(x as i16),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_u32(self) -> Option<u32> {
+        match self {
+            ImmediateValue::U64(x) => Some(x as u32),
+            ImmediateValue::S64(x) => Some(x as u32),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_i32(self) -> Option<i32> {
+        match self {
+            ImmediateValue::U64(x) => Some(x as i32),
+            ImmediateValue::S64(x) => Some(x as i32),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_u64(self) -> Option<u64> {
+        match self {
+            ImmediateValue::U64(x) => Some(x),
+            ImmediateValue::S64(x) => Some(x as u64),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_i64(self) -> Option<i64> {
+        match self {
+            ImmediateValue::U64(x) => Some(x as i64),
+            ImmediateValue::S64(x) => Some(x),
+            ImmediateValue::F32(_) | ImmediateValue::F64(_) => None,
+        }
+    }
+
+    pub fn as_f32(self) -> Option<f32> {
+        match self {
+            ImmediateValue::F32(x) => Some(x),
+            ImmediateValue::F64(_) | ImmediateValue::U64(_) | ImmediateValue::S64(_) => None,
+        }
+    }
+
+    pub fn as_f64(self) -> Option<f64> {
+        match self {
+            ImmediateValue::F32(x) => Some(x as f64),
+            ImmediateValue::F64(x) => Some(x),
+            ImmediateValue::U64(_) | ImmediateValue::S64(_) => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum Operand<Id> {
     Reg(Id),
-    RegOffset(Id, i32),
+    RegOffset(Id, i64),
     Imm(ImmediateValue),
     VecMember(Id, u8),
-    VecPack(Vec<Id>),
+    VecPack(Vec<RegOrImmediate<Id>>),
 }
 
-pub enum VectorPrefix {
-    V2,
-    V4,
+#[derive(Clone)]
+pub enum RegOrImmediate<Id> {
+    Reg(Id),
+    Imm(ImmediateValue),
 }
 
 pub struct LdDetails {
@@ -437,6 +784,7 @@ pub enum LdStQualifier {
     Volatile,
     Relaxed(MemScope),
     Acquire(MemScope),
+    Release(MemScope),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -458,7 +806,6 @@ pub enum LdCacheOperator {
 #[derive(Clone)]
 pub struct MovDetails {
     pub typ: Type,
-    pub src_is_address: bool,
     // two fields below are in use by member moves
     pub dst_width: u8,
     pub src_width: u8,
@@ -470,7 +817,6 @@ impl MovDetails {
     pub fn new(typ: Type) -> Self {
         MovDetails {
             typ,
-            src_is_address: false,
             dst_width: 0,
             src_width: 0,
             relaxed_src2_conv: false,
@@ -510,6 +856,13 @@ pub struct SetpData {
     pub cmp_op: SetpCompareOp,
 }
 
+pub struct SetData {
+    pub dst_type: ScalarType,
+    pub src_type: ScalarType,
+    pub flush_to_zero: bool,
+    pub cmp_op: SetpCompareOp,
+}
+
 #[derive(PartialEq, Eq, Copy, Clone)]
 pub enum SetpCompareOp {
     Eq,
@@ -528,17 +881,17 @@ pub enum SetpCompareOp {
     IsAnyNan,
 }
 
+pub struct SetpBoolData {
+    pub base: SetpData,
+    pub bool_op: SetpBoolPostOp,
+    pub negate_src3: bool,
+}
+
+#[derive(Clone, Copy)]
 pub enum SetpBoolPostOp {
     And,
     Or,
     Xor,
-}
-
-pub struct SetpBoolData {
-    pub typ: ScalarType,
-    pub flush_to_zero: Option<bool>,
-    pub cmp_op: SetpCompareOp,
-    pub bool_op: SetpBoolPostOp,
 }
 
 pub struct BraData {
@@ -558,6 +911,7 @@ pub struct CvtIntToIntDesc {
     pub saturate: bool,
 }
 
+#[derive(Clone)]
 pub struct CvtDesc {
     pub rounding: Option<RoundingMode>,
     pub flush_to_zero: Option<bool>,
@@ -634,6 +988,7 @@ pub struct CvtaDetails {
     pub size: CvtaSize,
 }
 
+#[derive(Clone, Copy)]
 pub enum CvtaSize {
     U32,
     U64,
@@ -654,25 +1009,20 @@ pub enum StCacheOperator {
     Writethrough,
 }
 
+#[derive(Copy, Clone)]
 pub struct RetData {
     pub uniform: bool,
 }
 
 #[derive(Copy, Clone)]
 pub enum MulDetails {
-    Unsigned(MulUInt),
-    Signed(MulSInt),
+    Unsigned(MulInt),
+    Signed(MulInt),
     Float(ArithFloat),
 }
 
 #[derive(Copy, Clone)]
-pub struct MulUInt {
-    pub typ: ScalarType,
-    pub control: MulIntControl,
-}
-
-#[derive(Copy, Clone)]
-pub struct MulSInt {
+pub struct MulInt {
     pub typ: ScalarType,
     pub control: MulIntControl,
 }
@@ -797,19 +1147,6 @@ pub enum DivFloatKind {
 pub enum NumsOrArrays<'a> {
     Nums(Vec<(&'a str, u32)>),
     Arrays(Vec<NumsOrArrays<'a>>),
-}
-
-#[derive(Copy, Clone)]
-pub struct SqrtDetails {
-    pub typ: ScalarType,
-    pub flush_to_zero: Option<bool>,
-    pub kind: SqrtKind,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq)]
-pub enum SqrtKind {
-    Approx,
-    Rounding(RoundingMode),
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -967,13 +1304,13 @@ pub enum ArrayOrPointer {
     Pointer,
 }
 
-bitflags! {
-    pub struct LinkingDirective: u8 {
-        const NONE = 0b000;
-        const EXTERN = 0b001;
-        const VISIBLE = 0b10;
-        const WEAK = 0b100;
-    }
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum LinkingDirective {
+    None,
+    Extern,
+    Visible,
+    Weak,
+    Common,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -982,8 +1319,10 @@ pub enum TuningDirective {
     MaxNtid(u32, u32, u32),
     ReqNtid(u32, u32, u32),
     MinNCtaPerSm(u32),
+    Noreturn,
 }
 
+#[repr(u8)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ScalarKind {
     Bit,
@@ -1016,6 +1355,40 @@ impl ScalarType {
             ScalarType::Pred => ScalarKind::Pred,
         }
     }
+}
+
+pub struct TexDetails {
+    pub geometry: TextureGeometry,
+    pub channel_type: ScalarType,
+    pub coordinate_type: ScalarType,
+    // direct = takes .texref, indirect = takes .u64
+    pub direct: bool,
+}
+
+pub struct SurfaceDetails {
+    pub geometry: TextureGeometry,
+    pub vector: Option<u8>,
+    pub type_: ScalarType,
+    // direct = takes .texref, indirect = takes .u64
+    pub direct: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TextureGeometry {
+    OneD,
+    TwoD,
+    ThreeD,
+    Array1D,
+    Array2D,
+}
+
+#[derive(Clone)]
+pub enum Initializer<ID> {
+    Constant(ImmediateValue),
+    Global(ID),
+    GenericGlobal(ID),
+    Add(Box<(Initializer<ID>, Initializer<ID>)>),
+    Array(Vec<Initializer<ID>>),
 }
 
 #[cfg(test)]

@@ -8,6 +8,11 @@ edition = "2018"
 name = "nvml"
 crate-type = ["cdylib"]
 
-[dependencies.ocl-core]
-version = "0.11"
-features = ["opencl_version_1_2", "opencl_version_2_0", "opencl_version_2_1"]
+[target.'cfg(windows)'.dependencies]
+atiadlxx-sys = { path = "../atiadlxx-sys" }
+
+[target.'cfg(unix)'.dependencies]
+rocm_smi-sys = { path = "../rocm_smi-sys" }
+
+[package.metadata.zluda]
+linux_names = ["libnvidia-ml.so", "libnvidia-ml.so.1"]

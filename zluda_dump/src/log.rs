@@ -1,12 +1,15 @@
-use crate::format;
-use cuda_types::CUmodule;
-use cuda_types::CUuuid;
-
 use super::CUresult;
 use super::Settings;
+use crate::format;
+use crate::format::CudaDisplay;
+use crate::parse_env_var;
+use cuda_types::*;
+use std::borrow::Cow;
+use std::env;
 use std::error::Error;
 use std::ffi::c_void;
-use std::ffi::NulError;
+use std::ffi::CString;
+use std::fmt;
 use std::fmt::Display;
 use std::fs::File;
 use std::io;
@@ -14,6 +17,10 @@ use std::io::Stderr;
 use std::io::Write;
 use std::path::PathBuf;
 use std::str::Utf8Error;
+use zluda_dark_api::AnyUInt;
+use zluda_dark_api::FatbinFileKind;
+use zluda_dark_api::DecompressionFailure;
+use zluda_dark_api::UnexpectedFieldError;
 
 const LOG_PREFIX: &[u8] = b"[ZLUDA_DUMP] ";
 
@@ -29,6 +36,7 @@ pub(crate) struct Factory {
     write_buffer: WriteBuffer,
     // another shared buffer, so we dont't reallocate on every function call
     log_queue: Vec<LogEntry>,
+    log_enable: bool,
 }
 
 // When writing out to the emitter (file, WinAPI, whatever else) instead of
@@ -148,18 +156,27 @@ impl Write for WriteBuffer {
 
 impl Factory {
     pub(crate) fn new() -> Self {
-        let debug_emitter = os::new_debug_logger();
+        let log_enable = parse_env_var::<bool, _>("ZLUDA_LOG_ENABLE", &mut |_| {}).unwrap_or(true);
+        let infallible_emitter = if !log_enable {
+            Box::new(NullLog)
+        } else {
+            os::new_debug_logger()
+        };
         Factory {
-            infallible_emitter: debug_emitter,
+            infallible_emitter,
             fallible_emitter: None,
             write_buffer: WriteBuffer::new(),
             log_queue: Vec::new(),
+            log_enable,
         }
     }
 
     fn initalize_fallible_emitter(
         settings: &Settings,
     ) -> std::io::Result<Option<Box<dyn WriteTrailingZeroAware>>> {
+        if !settings.log_enabled {
+            return Ok(None);
+        }
         settings
             .dump_dir
             .as_ref()
@@ -184,8 +201,9 @@ impl Factory {
         func: &'static str,
         arguments_writer: Box<dyn FnMut(&mut dyn std::io::Write) -> std::io::Result<()>>,
     ) -> (FunctionLogger, Settings) {
+        let log_enabled = self.log_enable;
         let mut first_logger = self.get_logger(func, arguments_writer);
-        let settings = Settings::read_and_init(&mut first_logger);
+        let settings = Settings::read_and_init(log_enabled, &mut first_logger);
         match Self::initalize_fallible_emitter(&settings) {
             Ok(fallible_emitter) => {
                 *first_logger.fallible_emitter = fallible_emitter;
@@ -264,6 +282,23 @@ impl<'a> FunctionLogger<'a> {
         }
     }
 
+    pub(crate) fn log_unwrap<T>(&mut self, err: Result<T, LogEntry>) -> Option<T> {
+        match err {
+            Ok(t) => Some(t),
+            Err(e) => {
+                self.log(e);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn log_fn(&mut self, f: impl FnOnce(&mut Self) -> Result<(), LogEntry>) {
+        let result = f(self);
+        if let Err(e) = result {
+            self.log(e)
+        }
+    }
+
     fn flush_log_queue_to_write_buffer(&mut self) {
         self.write_buffer.start_line();
         match self.name {
@@ -325,39 +360,68 @@ impl<'a> Drop for FunctionLogger<'a> {
 pub(crate) enum LogEntry {
     IoError(io::Error),
     CreatedDumpDirectory(PathBuf),
+    SideBySideStart(CString),
     ErrorBox(Box<dyn Error>),
     UnsupportedModule {
-        module: CUmodule,
+        module: Option<CUmodule>,
         raw_image: *const c_void,
-        kind: &'static str,
+        kind: FatbinFileKind,
     },
     MalformedModulePath(Utf8Error),
     NonUtf8ModuleText(Utf8Error),
-    NulInsideModuleText(NulError),
     ModuleParsingError(String),
     Lz4DecompressionFailure,
     UnknownExportTableFn,
-    UnexpectedArgument {
-        arg_name: &'static str,
-        expected: Vec<UInt>,
-        observed: UInt,
-    },
     UnexpectedBinaryField {
         field_name: &'static str,
-        expected: Vec<UInt>,
-        observed: UInt,
+        expected: Vec<AnyUInt>,
+        observed: AnyUInt,
     },
+    UnknownModule(CUmodule),
+    UnknownFunction(CUfunction, CUmodule, String),
+    UnknownFunctionUse(CUfunction),
+    NoCudaFunction(Cow<'static, str>),
+    CudaError(cuda_types::CUresult),
+    ArgumentMismatch {
+        devptr: *mut c_void,
+        diff_count: usize,
+        total_count: usize,
+    },
+    UnknownTexref(CUtexref),
+    EnvVarError(env::VarError),
+    MalformedEnvVar {
+        key: &'static str,
+        value: String,
+        err: Box<dyn Display>,
+    },
+    ExportTableLengthGuess(usize),
+    ExportTableLengthMismatch {
+        expected: usize,
+        observed: usize,
+    },
+    IntegrityHashOverride {
+        before: u128,
+        after: u128,
+    },
+    WrappedContext,
 }
 
 impl Display for LogEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt<'a>(&self, f: &mut std::fmt::Formatter<'a>) -> std::fmt::Result {
         match self {
             LogEntry::IoError(e) => e.fmt(f),
             LogEntry::CreatedDumpDirectory(dir) => {
                 write!(
                     f,
-                    "Created dump directory {} ",
+                    "Created dump directory {}",
                     dir.as_os_str().to_string_lossy()
+                )
+            }
+            LogEntry::SideBySideStart(device) => {
+                write!(
+                    f,
+                    "Side-by-side secondary device: {}",
+                    device.to_string_lossy()
                 )
             }
             LogEntry::ErrorBox(e) => e.fmt(f),
@@ -369,7 +433,9 @@ impl Display for LogEntry {
                 write!(
                     f,
                     "Unsupported {} module {:?} loaded from module image {:?}",
-                    kind, module, raw_image
+                    human_readable(*kind),
+                    module,
+                    raw_image
                 )
             }
             LogEntry::MalformedModulePath(e) => e.fmt(f),
@@ -381,8 +447,7 @@ impl Display for LogEntry {
                     file_name
                 )
             }
-            LogEntry::NulInsideModuleText(e) => e.fmt(f),
-            LogEntry::Lz4DecompressionFailure => write!(f, "LZ4 decompression failure"),
+            LogEntry::Lz4DecompressionFailure => write!(f, "Decompression failure"),
             LogEntry::UnknownExportTableFn => write!(f, "Unknown export table function"),
             LogEntry::UnexpectedBinaryField {
                 field_name,
@@ -399,38 +464,145 @@ impl Display for LogEntry {
                     .join(", "),
                 observed
             ),
-            LogEntry::UnexpectedArgument {
-                arg_name,
-                expected,
-                observed,
-            } => write!(
-                f,
-                "Unexpected argument {}. Expected one of: {{{}}}, observed: {}",
-                arg_name,
-                expected
-                    .iter()
-                    .map(|x| x.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                observed
-            ),
+            LogEntry::UnknownModule(module) => as_io_write(f, |f| {
+                f.write_all(b"Unknown module ")?;
+                CudaDisplay::write(module, "", 0, f)
+            }),
+            LogEntry::UnknownFunction(func, module, name) => as_io_write(f, |f| {
+                f.write_all(b"Unknown function ")?;
+                CudaDisplay::write(func, "", 0, f)?;
+                write!(f, " ({}) in module ", name)?;
+                CudaDisplay::write(module, "", 0, f)
+            }),
+            LogEntry::UnknownFunctionUse(func) => as_io_write(f, |f| {
+                f.write_all(b"Unknown function ")?;
+                CudaDisplay::write(func, "", 0, f)
+            }),
+            LogEntry::NoCudaFunction(fn_name) => {
+                write!(f, "Could not resolve CUDA function {}", fn_name)
+            }
+            LogEntry::CudaError(error) => as_io_write(f, |f| {
+                f.write_all(b"CUDA error ")?;
+                CudaDisplay::write(error, "", 0, f)
+            }),
+            LogEntry::ArgumentMismatch {
+                devptr,
+                diff_count,
+                total_count,
+            } => {
+                let total_percentage = (*diff_count as f64 / *total_count as f64) * 100f64;
+                write!(
+                    f,
+                    "Mismatched elements for argument {:p}. Mismatched elements: {} / {} ({}%)",
+                    *devptr, diff_count, total_count, total_percentage
+                )
+            }
+            LogEntry::UnknownTexref(texref) => as_io_write(f, |f| {
+                f.write_all(b"Unknown texture references ")?;
+                CudaDisplay::write(texref, "", 0, f)
+            }),
+            LogEntry::EnvVarError(err) => {
+                write!(f, "Error reading environment variable: {}", err)
+            }
+            LogEntry::MalformedEnvVar { key, value, err } => {
+                write!(
+                    f,
+                    "Error parsing environment variable with key {} and value {}: {}",
+                    key, value, err
+                )
+            }
+            LogEntry::ExportTableLengthGuess(length) => {
+                write!(
+                    f,
+                    "Unknown export table length, guessed length: {}",
+                    *length
+                )
+            }
+            LogEntry::ExportTableLengthMismatch { expected, observed } => {
+                write!(
+                    f,
+                    "Export table length mismatch. Expected: {}, observed: {}",
+                    *expected, *observed
+                )
+            }
+            LogEntry::IntegrityHashOverride { before, after } => {
+                write!(
+                    f,
+                    "Overriding integrity hash. Before: {before:032x}, after: {after:032x}"
+                )
+            }
+            LogEntry::WrappedContext => write!(f, "Observed wrapped context"),
         }
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum UInt {
-    U16(u16),
-    U32(u32),
-    USize(usize),
+fn as_io_write<'a, 'b: 'a>(
+    formatter: &'a mut fmt::Formatter<'b>,
+    func: impl FnOnce(&mut IoFormatter<'a, 'b>) -> io::Result<()>,
+) -> fmt::Result {
+    let mut formatter = IoFormatter { formatter };
+    func(&mut formatter).map_err(|_| fmt::Error)
 }
 
-impl Display for UInt {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            UInt::U16(x) => write!(f, "{:#x}", x),
-            UInt::U32(x) => write!(f, "{:#x}", x),
-            UInt::USize(x) => write!(f, "{:#x}", x),
+struct IoFormatter<'a, 'b: 'a> {
+    formatter: &'a mut fmt::Formatter<'b>,
+}
+
+impl<'a, 'b> fmt::Write for IoFormatter<'a, 'b> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.formatter.write_str(s)
+    }
+
+    fn write_char(&mut self, c: char) -> fmt::Result {
+        self.formatter.write_char(c)
+    }
+
+    fn write_fmt(&mut self, args: fmt::Arguments) -> fmt::Result {
+        self.formatter.write_fmt(args)
+    }
+}
+
+impl<'a, 'b> io::Write for IoFormatter<'a, 'b> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let str =
+            std::str::from_utf8(buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        self.formatter
+            .write_str(str)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn human_readable(kind: FatbinFileKind) -> &'static str {
+    match kind {
+        FatbinFileKind::Ptx => "PTX",
+        FatbinFileKind::Elf => "ELF",
+        FatbinFileKind::Archive => "Archive",
+    }
+}
+
+impl From<io::Error> for LogEntry {
+    fn from(e: io::Error) -> Self {
+        LogEntry::IoError(e)
+    }
+}
+
+impl From<DecompressionFailure> for LogEntry {
+    fn from(_err: DecompressionFailure) -> Self {
+        LogEntry::Lz4DecompressionFailure
+    }
+}
+
+impl From<UnexpectedFieldError> for LogEntry {
+    fn from(err: UnexpectedFieldError) -> Self {
+        LogEntry::UnexpectedBinaryField {
+            field_name: err.name,
+            expected: err.expected,
+            observed: err.observed,
         }
     }
 }
@@ -468,6 +640,22 @@ impl WriteTrailingZeroAware for Stderr {
 
     fn should_prefix(&self) -> bool {
         true
+    }
+}
+
+struct NullLog;
+
+impl WriteTrailingZeroAware for NullLog {
+    fn write_zero_aware(&mut self, _buf: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn should_prefix(&self) -> bool {
+        false
     }
 }
 
@@ -516,10 +704,10 @@ mod os {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, cell::RefCell, io, rc::Rc, str};
+    use std::{cell::RefCell, io, rc::Rc, str};
 
     use super::{FunctionLogger, LogEntry, WriteTrailingZeroAware};
-    use crate::{log::WriteBuffer, CUresult};
+    use crate::{log::CudaFunctionName, log::WriteBuffer, CUresult};
 
     struct FailOnNthWrite {
         fail_on: usize,
@@ -578,9 +766,10 @@ mod tests {
         let mut log_queue = Vec::new();
         let mut func_logger = FunctionLogger {
             result: Some(CUresult::CUDA_SUCCESS),
-            name: Cow::Borrowed("cuInit"),
+            name: CudaFunctionName::Normal("cuInit"),
             infallible_emitter: &mut infallible_emitter,
             fallible_emitter: &mut fallible_emitter,
+            arguments_writer: None,
             write_buffer: &mut write_buffer,
             log_queue: &mut log_queue,
         };
@@ -595,7 +784,7 @@ mod tests {
         let result_str = str::from_utf8(&*result).unwrap();
         let result_lines = result_str.lines().collect::<Vec<_>>();
         assert_eq!(result_lines.len(), 5);
-        assert_eq!(result_lines[0], "cuInit(...) -> 0x0");
+        assert_eq!(result_lines[0], "cuInit(...) -> CUDA_SUCCESS");
         assert!(result_lines[1].starts_with("    "));
         assert!(result_lines[2].starts_with("    "));
         assert!(result_lines[3].starts_with("    "));

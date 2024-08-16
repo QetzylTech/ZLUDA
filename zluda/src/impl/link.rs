@@ -1,86 +1,112 @@
-use std::{
-    ffi::{c_void, CStr},
-    mem, ptr, slice,
-};
+use super::{context, module, LiveCheck, ZludaObject, GLOBAL_STATE};
+use cuda_types::*;
+use std::{borrow::Cow, ptr, sync::Mutex};
 
-use hip_runtime_sys::{hipCtxGetDevice, hipError_t, hipGetDeviceProperties};
+pub(crate) type LinkState = LiveCheck<LinkStateData>;
 
-use crate::{
-    cuda::{CUjitInputType, CUjit_option, CUlinkState, CUresult},
-    hip_call,
-};
+impl ZludaObject for LinkStateData {
+    #[cfg(target_pointer_width = "64")]
+    const LIVENESS_COOKIE: usize = 0x0f8acfce25ea71da;
+    #[cfg(target_pointer_width = "32")]
+    const LIVENESS_COOKIE: usize = 0x5f92e7dc;
+    const LIVENESS_FAIL: CUresult = CUresult::CUDA_ERROR_INVALID_HANDLE;
 
-use super::module::{self, SpirvModule};
-
-struct LinkState {
-    modules: Vec<SpirvModule>,
-    result: Option<Vec<u8>>,
+    fn drop_with_result(&mut self, _by_owner: bool) -> Result<(), CUresult> {
+        Ok(())
+    }
 }
 
-pub(crate) unsafe fn create(
-    num_options: u32,
-    options: *mut CUjit_option,
-    option_values: *mut *mut c_void,
-    state_out: *mut CUlinkState,
-) -> CUresult {
-    if state_out == ptr::null_mut() {
-        return CUresult::CUDA_ERROR_INVALID_VALUE;
-    }
-    let state = Box::new(LinkState {
-        modules: Vec::new(),
-        result: None,
-    });
-    *state_out = mem::transmute(state);
-    CUresult::CUDA_SUCCESS
+pub(crate) struct LinkStateData {
+    ptx_modules: Mutex<Vec<Cow<'static, str>>>,
 }
 
 pub(crate) unsafe fn add_data(
-    state: CUlinkState,
+    state: *mut LinkState,
     type_: CUjitInputType,
-    data: *mut c_void,
-    size: usize,
-    name: *const i8,
-    num_options: u32,
-    options: *mut CUjit_option,
-    option_values: *mut *mut c_void,
-) -> Result<(), hipError_t> {
-    if state == ptr::null_mut() {
-        return Err(hipError_t::hipErrorInvalidValue);
+    data: *mut ::std::os::raw::c_void,
+    mut size: usize,
+    _name: *const ::std::os::raw::c_char,
+    _num_options: ::std::os::raw::c_uint,
+    _options: *mut CUjit_option,
+    _option_values: *mut *mut ::std::os::raw::c_void,
+) -> Result<(), CUresult> {
+    let state = LiveCheck::as_result(state)?;
+    match type_ {
+        CUjitInputType::CU_JIT_INPUT_PTX => {
+            let data = data.cast::<u8>();
+            loop {
+                if *data.add(size - 1) == 0 {
+                    size -= 1;
+                } else {
+                    break;
+                }
+            }
+            let buffer = std::slice::from_raw_parts(data.cast::<u8>(), size);
+            let buffer =
+                std::str::from_utf8(buffer).map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?;
+            let ptx = buffer.to_string();
+            let mut modules = state
+                .ptx_modules
+                .lock()
+                .map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
+            modules.push(Cow::Owned(ptx));
+            Ok(())
+        }
+        // Right now only user of this data type is
+        // V-Ray, which passes CUDA Runtime archive
+        // that is not used anyway
+        CUjitInputType::CU_JIT_INPUT_LIBRARY => Ok(()),
+        _ => Err(CUresult::CUDA_ERROR_NOT_SUPPORTED),
     }
-    let state: *mut LinkState = mem::transmute(state);
-    let state = &mut *state;
-    // V-RAY specific hack
-    if state.modules.len() == 2 {
-        return Err(hipError_t::hipSuccess);
-    }
-    let spirv_data = SpirvModule::new_raw(data as *const _)?;
-    state.modules.push(spirv_data);
-    Ok(())
 }
 
 pub(crate) unsafe fn complete(
-    state: CUlinkState,
-    cubin_out: *mut *mut c_void,
+    state: *mut LinkState,
+    cubin_out: *mut *mut ::std::os::raw::c_void,
     size_out: *mut usize,
-) -> Result<(), hipError_t> {
-    let mut dev = 0;
-    hip_call! { hipCtxGetDevice(&mut dev) };
-    let mut props = unsafe { mem::zeroed() };
-    hip_call! { hipGetDeviceProperties(&mut props, dev) };
-    let state: &mut LinkState = mem::transmute(state);
-    let spirv_bins = state.modules.iter().map(|m| &m.binaries[..]);
-    let should_link_ptx_impl = state.modules.iter().find_map(|m| m.should_link_ptx_impl);
-    let mut arch_binary = module::compile_amd(&props, spirv_bins, should_link_ptx_impl)
-        .map_err(|_| hipError_t::hipErrorUnknown)?;
-    let ptr = arch_binary.as_mut_ptr();
-    let size = arch_binary.len();
-    state.result = Some(arch_binary);
-    *cubin_out = ptr as _;
+) -> Result<(), CUresult> {
+    if cubin_out == std::ptr::null_mut() || size_out == std::ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    let state = LiveCheck::as_result(state)?;
+    let modules = state
+        .ptx_modules
+        .lock()
+        .map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
+    let device = context::with_current(|ctx| ctx.device)?;
+    let global_state = GLOBAL_STATE.get()?;
+    let device_object = global_state.device(device)?;
+    let module = module::link_build_zluda_module(
+        global_state,
+        device_object.compilation_mode,
+        &device_object.comgr_isa,
+        &modules,
+    )?;
+    let module = module.into_boxed_slice();
+    let size = module.len();
+    let ptr = Box::into_raw(module);
     *size_out = size;
+    *cubin_out = ptr.cast();
     Ok(())
 }
 
-pub(crate) unsafe fn destroy(state: CUlinkState) -> CUresult {
-    let state: Box<LinkState> = mem::transmute(state);
-    CUresult::CUDA_SUCCESS
+pub(crate) unsafe fn create(
+    _num_options: ::std::os::raw::c_uint,
+    _options: *mut CUjit_option,
+    _option_values: *mut *mut ::std::os::raw::c_void,
+    state_out: *mut *mut LinkState,
+) -> Result<(), CUresult> {
+    let link_state = LinkState::new(LinkStateData {
+        ptx_modules: Mutex::new(Vec::new()),
+    });
+    let link_state = Box::into_raw(Box::new(link_state));
+    *state_out = link_state;
+    Ok(())
+}
+
+pub(crate) unsafe fn destroy(state: *mut LinkState) -> Result<(), CUresult> {
+    if state == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    LiveCheck::drop_box_with_result(state, false)
 }

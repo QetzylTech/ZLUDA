@@ -3,7 +3,7 @@
 extern crate detours_sys;
 extern crate winapi;
 
-use std::{ffi::c_void, mem, ptr, slice, usize};
+use std::{ffi::c_void, mem, path::PathBuf, ptr, slice, usize};
 
 use detours_sys::{
     DetourAttach, DetourRestoreAfterWith, DetourTransactionAbort, DetourTransactionBegin,
@@ -14,17 +14,21 @@ use winapi::{
     shared::minwindef::{BOOL, LPVOID},
     um::{
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
-        libloaderapi::GetModuleFileNameW,
+        libloaderapi::{
+            FindResourceW, GetModuleFileNameW, GetModuleHandleA, GetModuleHandleW, LoadResource,
+        },
         minwinbase::LPSECURITY_ATTRIBUTES,
         processthreadsapi::{
             CreateProcessA, GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread,
             SuspendThread, TerminateProcess, LPPROCESS_INFORMATION, LPSTARTUPINFOA, LPSTARTUPINFOW,
         },
+        sysinfoapi::GetSystemDirectoryA,
         tlhelp32::{
             CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
         },
         winbase::CREATE_SUSPENDED,
         winnt::{LPSTR, LPWSTR, THREAD_SUSPEND_RESUME},
+        winuser::{MAKEINTRESOURCEW, RT_VERSION},
     },
 };
 use winapi::{
@@ -47,14 +51,27 @@ use winapi::{
 
 include!("payload_guid.rs");
 
-const NVCUDA_UTF8: &'static str = "NVCUDA.DLL";
-const NVCUDA_UTF16: &[u16] = wch!("NVCUDA.DLL");
+const WIN_MAX_PATH: usize = 260;
+const NVCUDA1_UTF8: &'static str = "NVCUDA.DLL";
+const NVCUDA1_UTF16: &[u16] = wch!("NVCUDA.DLL");
+const NVCUDA2_UTF8: &'static str = "NVCUDA.DLL";
+const NVCUDA2_UTF16: &[u16] = wch!("NVCUDA.DLL");
 const NVML_UTF8: &'static str = "NVML.DLL";
 const NVML_UTF16: &[u16] = wch!("NVML.DLL");
+const NVAPI_UTF8: &'static str = "NVAPI64.DLL";
+const NVAPI_UTF16: &[u16] = wch!("NVAPI64.DLL");
+const NVOPTIX_UTF8: &'static str = "OPTIX.6.6.0.DLL";
+const NVOPTIX_UTF16: &[u16] = wch!("OPTIX.6.6.0.DLL");
 static mut ZLUDA_PATH_UTF8: Option<&'static [u8]> = None;
 static mut ZLUDA_PATH_UTF16: Vec<u16> = Vec::new();
 static mut ZLUDA_ML_PATH_UTF8: Option<&'static [u8]> = None;
 static mut ZLUDA_ML_PATH_UTF16: Vec<u16> = Vec::new();
+static mut ZLUDA_API_PATH_UTF8: Option<&'static [u8]> = None;
+static mut ZLUDA_API_PATH_UTF16: Option<Vec<u16>> = None;
+static mut ZLUDA_OPTIX_PATH_UTF8: Option<&'static [u8]> = None;
+static mut ZLUDA_OPTIX_PATH_UTF16: Option<Vec<u16>> = None;
+static mut DRIVERSTORE_UTF8: Vec<u8> = Vec::new();
+static mut DRIVERSTORE_UTF16: Vec<u16> = Vec::new();
 static mut CURRENT_MODULE_FILENAME: Vec<u8> = Vec::new();
 static mut DETOUR_STATE: Option<DetourDetachGuard> = None;
 
@@ -163,26 +180,98 @@ unsafe extern "system" fn ZludaLoadLibraryW_NoRedirect(lpLibFileName: LPCWSTR) -
 
 #[allow(non_snake_case)]
 unsafe extern "system" fn ZludaLoadLibraryA(lpLibFileName: LPCSTR) -> HMODULE {
-    let nvcuda_file_name = if is_nvcuda_dll_utf8(lpLibFileName as *const _) {
-        ZLUDA_PATH_UTF8.unwrap().as_ptr() as *const _
-    } else if is_nvml_dll_utf8(lpLibFileName as *const _) {
-        ZLUDA_ML_PATH_UTF8.unwrap().as_ptr() as *const _
+    let library_name = get_library_name_utf8(lpLibFileName as _);
+    (LOAD_LIBRARY_A)(library_name as _)
+}
+
+unsafe fn get_library_name_utf8(raw_library_name: *const u8) -> *const u8 {
+    let library_name = zero_terminated(raw_library_name);
+    if is_driverstore_utf8(library_name) {
+        if let Some(last_separator) = library_name
+            .iter()
+            .copied()
+            .rposition(|c| c as char == '\\' || c as char == '/')
+        {
+            let existing_module =
+                GetModuleHandleA(library_name[last_separator + 1..].as_ptr() as _);
+            if probably_is_nvidia_dll(existing_module) {
+                return raw_library_name;
+            }
+        }
+    }
+    if is_nvcuda_dll_utf8(library_name) {
+        return ZLUDA_PATH_UTF8.unwrap().as_ptr();
+    } else if is_nvml_dll_utf8(library_name) {
+        return ZLUDA_ML_PATH_UTF8.unwrap().as_ptr();
     } else {
-        lpLibFileName
+        if let Some(nvapi_path) = ZLUDA_API_PATH_UTF8 {
+            if is_nvapi_dll_utf8(library_name) {
+                return nvapi_path.as_ptr();
+            }
+        }
+        if let Some(optix_path) = ZLUDA_OPTIX_PATH_UTF8 {
+            if is_nvoptix_dll_utf8(library_name) {
+                return optix_path.as_ptr();
+            }
+        }
     };
-    (LOAD_LIBRARY_A)(nvcuda_file_name)
+    raw_library_name
 }
 
 #[allow(non_snake_case)]
 unsafe extern "system" fn ZludaLoadLibraryW(lpLibFileName: LPCWSTR) -> HMODULE {
-    let nvcuda_file_name = if is_nvcuda_dll_utf16(lpLibFileName) {
-        ZLUDA_PATH_UTF16.as_ptr()
-    } else if is_nvml_dll_utf16(lpLibFileName as *const _) {
-        ZLUDA_ML_PATH_UTF16.as_ptr()
+    let library_name = get_library_name_utf16(lpLibFileName);
+    (LOAD_LIBRARY_W)(library_name)
+}
+
+unsafe fn get_library_name_utf16(raw_library_name: *const u16) -> *const u16 {
+    let library_name = zero_terminated(raw_library_name);
+    if is_driverstore_utf16(library_name) {
+        if let Some(last_separator) = library_name.iter().copied().rposition(|c| {
+            char::from_u32(c as u32).unwrap_or_default() == '\\'
+                || char::from_u32(c as u32).unwrap_or_default() == '/'
+        }) {
+            let existing_module = GetModuleHandleW(library_name[last_separator + 1..].as_ptr());
+            if probably_is_nvidia_dll(existing_module) {
+                return raw_library_name;
+            }
+        }
+    }
+    if is_nvcuda_dll_utf16(library_name) {
+        return ZLUDA_PATH_UTF16.as_ptr();
+    } else if is_nvml_dll_utf16(library_name) {
+        return ZLUDA_ML_PATH_UTF16.as_ptr();
     } else {
-        lpLibFileName
+        if let Some(nvapi_path) = ZLUDA_API_PATH_UTF16.as_ref() {
+            if is_nvapi_dll_utf16(library_name) {
+                return nvapi_path.as_ptr();
+            }
+        }
+        if let Some(optix_path) = ZLUDA_OPTIX_PATH_UTF16.as_ref() {
+            if is_nvoptix_dll_utf16(library_name) {
+                return optix_path.as_ptr();
+            }
+        }
     };
-    (LOAD_LIBRARY_W)(nvcuda_file_name)
+    raw_library_name
+}
+
+unsafe fn probably_is_nvidia_dll(module: HMODULE) -> bool {
+    if module == ptr::null_mut() {
+        return false;
+    }
+    let resource_handle = FindResourceW(module, MAKEINTRESOURCEW(1), RT_VERSION);
+    if resource_handle == ptr::null_mut() {
+        return false;
+    }
+    let resource = LoadResource(module, resource_handle);
+    if resource == ptr::null_mut() {
+        return false;
+    }
+    let version_len = *(resource as *mut u16);
+    let resource_slice = slice::from_raw_parts(resource as *const u8, version_len as usize);
+    let key = wch!("NVIDIA");
+    memchr::memmem::find(resource_slice, key.align_to::<u8>().1).is_some()
 }
 
 #[allow(non_snake_case)]
@@ -191,14 +280,8 @@ unsafe extern "system" fn ZludaLoadLibraryExA(
     hFile: HANDLE,
     dwFlags: DWORD,
 ) -> HMODULE {
-    let nvcuda_file_name = if is_nvcuda_dll_utf8(lpLibFileName as *const _) {
-        ZLUDA_PATH_UTF8.unwrap().as_ptr() as *const _
-    } else if is_nvml_dll_utf8(lpLibFileName as *const _) {
-        ZLUDA_ML_PATH_UTF8.unwrap().as_ptr() as *const _
-    } else {
-        lpLibFileName
-    };
-    (LOAD_LIBRARY_EX_A)(nvcuda_file_name, hFile, dwFlags)
+    let library_name = get_library_name_utf8(lpLibFileName as _);
+    (LOAD_LIBRARY_EX_A)(library_name as _, hFile, dwFlags)
 }
 
 #[allow(non_snake_case)]
@@ -207,14 +290,112 @@ unsafe extern "system" fn ZludaLoadLibraryExW(
     hFile: HANDLE,
     dwFlags: DWORD,
 ) -> HMODULE {
-    let nvcuda_file_name = if is_nvcuda_dll_utf16(lpLibFileName) {
-        ZLUDA_PATH_UTF16.as_ptr()
-    } else if is_nvml_dll_utf16(lpLibFileName as *const _) {
-        ZLUDA_ML_PATH_UTF16.as_ptr()
+    let library_name = get_library_name_utf16(lpLibFileName);
+    (LOAD_LIBRARY_EX_W)(library_name, hFile, dwFlags)
+}
+
+unsafe fn zero_terminated<T: Default + PartialEq>(t: *const T) -> &'static [T] {
+    let mut len = 0;
+    loop {
+        if *t.add(len) == T::default() {
+            break;
+        }
+        len += 1;
+    }
+    std::slice::from_raw_parts(t, len)
+}
+
+unsafe fn is_driverstore_utf8(lib: &[u8]) -> bool {
+    starts_with_ignore_case(lib, &DRIVERSTORE_UTF8, utf8_to_ascii_uppercase)
+}
+
+unsafe fn is_driverstore_utf16(lib: &[u16]) -> bool {
+    starts_with_ignore_case(lib, &DRIVERSTORE_UTF16, utf16_to_ascii_uppercase)
+}
+
+fn is_nvcuda_dll_utf8(lib: &[u8]) -> bool {
+    is_dll_utf8(lib, NVCUDA1_UTF8.as_bytes()) || is_dll_utf8(lib, NVCUDA2_UTF8.as_bytes())
+}
+
+fn is_nvcuda_dll_utf16(lib: &[u16]) -> bool {
+    is_dll_utf16(lib, NVCUDA1_UTF16) || is_dll_utf16(lib, NVCUDA2_UTF16)
+}
+
+fn is_nvml_dll_utf8(lib: &[u8]) -> bool {
+    is_dll_utf8(lib, NVML_UTF8.as_bytes())
+}
+
+fn is_nvml_dll_utf16(lib: &[u16]) -> bool {
+    is_dll_utf16(lib, NVML_UTF16)
+}
+
+fn is_nvapi_dll_utf8(lib: &[u8]) -> bool {
+    is_dll_utf8(lib, NVAPI_UTF8.as_bytes())
+}
+
+fn is_nvapi_dll_utf16(lib: &[u16]) -> bool {
+    is_dll_utf16(lib, NVAPI_UTF16)
+}
+
+fn is_nvoptix_dll_utf8(lib: &[u8]) -> bool {
+    is_dll_utf8(lib, NVOPTIX_UTF8.as_bytes())
+}
+
+fn is_nvoptix_dll_utf16(lib: &[u16]) -> bool {
+    is_dll_utf16(lib, NVOPTIX_UTF16)
+}
+
+fn is_dll_utf8(lib: &[u8], name: &[u8]) -> bool {
+    ends_with_ignore_case(lib, name, utf8_to_ascii_uppercase)
+}
+
+fn is_dll_utf16(lib: &[u16], name: &[u16]) -> bool {
+    ends_with_ignore_case(lib, name, utf16_to_ascii_uppercase)
+}
+
+fn utf8_to_ascii_uppercase(c: u8) -> u8 {
+    c.to_ascii_uppercase()
+}
+
+fn utf16_to_ascii_uppercase(c: u16) -> u16 {
+    if c >= 'a' as u16 && c <= 'z' as u16 {
+        c - 32
     } else {
-        lpLibFileName
-    };
-    (LOAD_LIBRARY_EX_W)(nvcuda_file_name, hFile, dwFlags)
+        c
+    }
+}
+
+fn ends_with_ignore_case<T: Copy + PartialEq>(
+    haystack: &[T],
+    needle: &[T],
+    uppercase: impl Fn(T) -> T,
+) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let offset = haystack.len() - needle.len();
+    for i in 0..needle.len() {
+        if uppercase(haystack[offset + i]) != needle[i] {
+            return false;
+        }
+    }
+    true
+}
+
+fn starts_with_ignore_case<T: Copy + PartialEq>(
+    haystack: &[T],
+    needle: &[T],
+    uppercase: impl Fn(T) -> T,
+) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    for i in 0..needle.len() {
+        if uppercase(haystack[i]) != needle[i] {
+            return false;
+        }
+    }
+    true
 }
 
 #[allow(non_snake_case)]
@@ -556,15 +737,45 @@ unsafe fn continue_create_process_hook(
         detours_sys::DetourCopyPayloadToProcess(
             (*process_information).hProcess,
             &PAYLOAD_NVML_GUID,
-            ZLUDA_ML_PATH_UTF16.as_ptr() as *mut _,
-            (ZLUDA_ML_PATH_UTF16.len() * mem::size_of::<u16>()) as u32,
+            ZLUDA_ML_PATH_UTF8.unwrap().as_ptr() as *mut _,
+            (ZLUDA_ML_PATH_UTF8.unwrap().len() * mem::size_of::<u8>()) as u32,
         );
         detours_sys::DetourCopyPayloadToProcess(
             (*process_information).hProcess,
             &PAYLOAD_NVCUDA_GUID,
-            ZLUDA_PATH_UTF16.as_ptr() as *mut _,
-            (ZLUDA_PATH_UTF16.len() * mem::size_of::<u16>()) as u32,
+            ZLUDA_PATH_UTF8.unwrap().as_ptr() as *mut _,
+            (ZLUDA_PATH_UTF8.unwrap().len() * mem::size_of::<u8>()) as u32,
         );
+    }
+    if let Some(nvapi_path) = ZLUDA_API_PATH_UTF8 {
+        if DetourUpdateProcessWithDll(
+            (*process_information).hProcess,
+            &mut nvapi_path.as_ptr() as *mut _ as *mut _,
+            1,
+        ) != FALSE
+        {
+            detours_sys::DetourCopyPayloadToProcess(
+                (*process_information).hProcess,
+                &PAYLOAD_NVAPI_GUID,
+                nvapi_path.as_ptr() as *mut _,
+                (nvapi_path.len() * mem::size_of::<u8>()) as u32,
+            );
+        }
+    }
+    if let Some(optix_path) = ZLUDA_OPTIX_PATH_UTF8 {
+        if DetourUpdateProcessWithDll(
+            (*process_information).hProcess,
+            &mut optix_path.as_ptr() as *mut _ as *mut _,
+            1,
+        ) != FALSE
+        {
+            detours_sys::DetourCopyPayloadToProcess(
+                (*process_information).hProcess,
+                &PAYLOAD_NVOPTIX_GUID,
+                optix_path.as_ptr() as *mut _,
+                (optix_path.len() * mem::size_of::<u8>()) as u32,
+            );
+        }
     }
     if original_creation_flags & CREATE_SUSPENDED == 0 {
         if ResumeThread((*process_information).hThread) == -1i32 as u32 {
@@ -573,68 +784,6 @@ unsafe fn continue_create_process_hook(
         }
     }
     create_proc_result
-}
-
-fn is_nvcuda_dll_utf8(lib: *const u8) -> bool {
-    is_dll_utf8(lib, NVCUDA_UTF8.as_bytes())
-}
-
-fn is_nvcuda_dll_utf16(lib: *const u16) -> bool {
-    is_dll_utf16(lib, NVCUDA_UTF16)
-}
-
-fn is_nvml_dll_utf8(lib: *const u8) -> bool {
-    is_dll_utf8(lib, NVML_UTF8.as_bytes())
-}
-
-fn is_nvml_dll_utf16(lib: *const u16) -> bool {
-    is_dll_utf16(lib, NVML_UTF16)
-}
-
-fn is_dll_utf8(lib: *const u8, name: &[u8]) -> bool {
-    is_dll_impl(lib, 0, name, |c| {
-        if c >= 'a' as u8 && c <= 'z' as u8 {
-            c - 32
-        } else {
-            c
-        }
-    })
-}
-
-fn is_dll_utf16(lib: *const u16, name: &[u16]) -> bool {
-    is_dll_impl(lib, 0u16, name, |c| {
-        if c >= 'a' as u16 && c <= 'z' as u16 {
-            c - 32
-        } else {
-            c
-        }
-    })
-}
-
-fn is_dll_impl<T: Copy + PartialEq>(
-    lib: *const T,
-    zero: T,
-    dll_name: &[T],
-    uppercase: impl Fn(T) -> T,
-) -> bool {
-    let mut len = 0;
-    loop {
-        if unsafe { *lib.offset(len) } == zero {
-            break;
-        }
-        len += 1;
-    }
-    if (len as usize) < dll_name.len() {
-        return false;
-    }
-    let slice =
-        unsafe { slice::from_raw_parts(lib.offset(len - dll_name.len() as isize), dll_name.len()) };
-    for i in 0..dll_name.len() {
-        if uppercase(slice[i]) != dll_name[i] {
-            return false;
-        }
-    }
-    true
 }
 
 #[allow(non_snake_case)]
@@ -683,31 +832,46 @@ unsafe fn initialize_globals(current_module: HINSTANCE) -> bool {
         }
         module_name.resize(module_name.len() * 2, 0);
     }
-    if !load_global_string(
-        &PAYLOAD_NVML_GUID,
-        &mut ZLUDA_ML_PATH_UTF8,
-        &mut ZLUDA_ML_PATH_UTF16,
-    ) {
+    let mut system_dir = vec![0; WIN_MAX_PATH];
+    let system_dir_len =
+        GetSystemDirectoryA(system_dir.as_mut_ptr() as *mut i8, system_dir.len() as u32);
+    if system_dir_len == 0 {
         return false;
     }
-    if !load_global_string(
-        &PAYLOAD_NVCUDA_GUID,
-        &mut ZLUDA_PATH_UTF8,
-        &mut ZLUDA_PATH_UTF16,
-    ) {
+    system_dir.truncate(system_dir_len as usize);
+    let mut driver_store = PathBuf::from(std::str::from_utf8_unchecked(&*system_dir));
+    driver_store.push("DriverStore");
+    driver_store.push("FileRepository");
+    let driver_store_string = driver_store.to_str().unwrap().to_ascii_uppercase();
+    DRIVERSTORE_UTF16 = driver_store_string.encode_utf16().collect::<Vec<_>>();
+    DRIVERSTORE_UTF8 = driver_store_string.into_bytes();
+    if !load_global_string(&PAYLOAD_NVCUDA_GUID, &mut ZLUDA_PATH_UTF8, || {
+        &mut ZLUDA_PATH_UTF16
+    }) {
         return false;
     }
+    if !load_global_string(&PAYLOAD_NVML_GUID, &mut ZLUDA_ML_PATH_UTF8, || {
+        &mut ZLUDA_ML_PATH_UTF16
+    }) {
+        return false;
+    }
+    load_global_string(&PAYLOAD_NVAPI_GUID, &mut ZLUDA_API_PATH_UTF8, || {
+        ZLUDA_API_PATH_UTF16.get_or_insert(Vec::new())
+    });
+    load_global_string(&PAYLOAD_NVOPTIX_GUID, &mut ZLUDA_OPTIX_PATH_UTF8, || {
+        ZLUDA_OPTIX_PATH_UTF16.get_or_insert(Vec::new())
+    });
     true
 }
 
 fn load_global_string(
     guid: &detours_sys::GUID,
     utf8_path: &mut Option<&'static [u8]>,
-    utf16_path: &mut Vec<u16>,
+    utf16_path: impl FnOnce() -> &'static mut Vec<u16>,
 ) -> bool {
     if let Some(payload) = get_payload(guid) {
         *utf8_path = Some(payload);
-        *utf16_path = unsafe { std::str::from_utf8_unchecked(payload) }
+        *utf16_path() = unsafe { std::str::from_utf8_unchecked(payload) }
             .encode_utf16()
             .collect::<Vec<_>>();
         true
@@ -716,14 +880,14 @@ fn load_global_string(
     }
 }
 
-fn get_payload(guid: &detours_sys::GUID) -> Option<&'static [u8]> {
+fn get_payload<T: Copy>(guid: &detours_sys::GUID) -> Option<&'static [T]> {
     let mut size = 0;
     let payload_ptr = unsafe { detours_sys::DetourFindPayloadEx(guid, &mut size) };
     if payload_ptr != ptr::null_mut() {
         Some(unsafe {
             slice::from_raw_parts(
                 payload_ptr as *const _,
-                (size as usize) / mem::size_of::<u16>(),
+                (size as usize) / mem::size_of::<T>(),
             )
         })
     } else {

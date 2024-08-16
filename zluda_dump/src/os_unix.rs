@@ -1,15 +1,19 @@
-use crate::cuda::CUuuid;
 use std::ffi::{c_void, CStr, CString};
 use std::mem;
 
-pub(crate) const LIBCUDA_DEFAULT_PATH: &'static str = b"/usr/lib/x86_64-linux-gnu/libcuda.so.1\0";
+pub(crate) const LIBCUDA_DEFAULT_PATH: &'static str = "/usr/lib/x86_64-linux-gnu/libcuda.so.1";
 
 pub unsafe fn load_library(libcuda_path: &str) -> *mut c_void {
     let libcuda_path = CString::new(libcuda_path).unwrap();
-    libc::dlopen(
+    // I would like to use dlmopen but NVIDIA's CUDA does not survive it
+    let result = libc::dlopen(
         libcuda_path.as_ptr() as *const _,
-        libc::RTLD_LOCAL | libc::RTLD_NOW,
-    )
+        libc::RTLD_LOCAL | libc::RTLD_LAZY,
+    );
+    if result == std::ptr::null_mut() {
+        panic!("{}", CStr::from_ptr(libc::dlerror()).to_string_lossy());
+    }
+    result
 }
 
 pub unsafe fn get_proc_address(handle: *mut c_void, func: &CStr) -> *mut c_void {
@@ -34,18 +38,16 @@ macro_rules! os_log {
 #[cfg(target_arch = "x86_64")]
 pub fn get_thunk(
     original_fn: *const c_void,
-    report_fn: unsafe extern "system" fn(*const CUuuid, usize),
-    guid: *const CUuuid,
+    report_fn: unsafe extern "system" fn(*const [u8; 16], usize),
+    guid: *const [u8; 16],
     idx: usize,
 ) -> *const c_void {
     use dynasmrt::{dynasm, DynasmApi};
     let mut ops = dynasmrt::x86::Assembler::new().unwrap();
     let start = ops.offset();
-    // Let's hope there's never more than 6 arguments
     dynasm!(ops
         ; .arch x64
-        ; push rbp
-        ; mov rbp, rsp
+        ; sub rsp, 8 // push stack for alignment
         ; push rdi
         ; push rsi
         ; push rdx
@@ -62,10 +64,9 @@ pub fn get_thunk(
         ; pop rdx
         ; pop rsi
         ; pop rdi
+        ; add rsp, 8 // pop stack
         ; mov rax, QWORD original_fn as i64
-        ; call rax
-        ; pop rbp
-        ; ret
+        ; jmp rax
         ; int 3
     );
     let exe_buf = ops.finalize().unwrap();

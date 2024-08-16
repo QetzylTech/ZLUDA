@@ -1,261 +1,464 @@
+use super::context::Context;
+use super::{context, function, LiveCheck, ZludaObject};
+use crate::hip_call_cuda;
+use crate::r#impl::function::FunctionData;
+use crate::r#impl::{comgr_error_to_cuda, device, hipfix, GLOBAL_STATE};
+use cuda_types::{CUmoduleLoadingMode, CUresult};
+use hip_common::CompilationMode;
+use hip_runtime_sys::*;
+use ptx::ModuleParserExt;
+use rustc_hash::FxHashMap;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::cmp;
+use std::collections::hash_map;
 use std::ffi::{CStr, CString};
-use std::fs::File;
-use std::io::{self, Read, Write};
-use std::ops::Add;
-use std::os::raw::c_char;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::{env, fs, iter, mem, ptr, slice};
+use std::ptr::{self, NonNull};
+use std::sync::Mutex;
+use zluda_dark_api::{CUmoduleContent, FatbinFileKind};
 
-use hip_runtime_sys::{
-    hipCtxGetCurrent, hipCtxGetDevice, hipDeviceGetAttribute, hipDeviceGetName, hipDeviceProp_t,
-    hipError_t, hipGetDeviceProperties, hipGetStreamDeviceId, hipModuleLoadData,
-};
-use tempfile::NamedTempFile;
+const EMPTY_MODULE: &'static str = include_str!("empty_module.ptx");
 
-use crate::cuda::CUmodule;
-use crate::hip_call;
+pub(crate) type Module = LiveCheck<ModuleData>;
 
-pub struct SpirvModule {
-    pub binaries: Vec<u32>,
-    pub kernel_info: HashMap<String, ptx::KernelInfo>,
-    pub should_link_ptx_impl: Option<(&'static [u8], &'static [u8])>,
-    pub build_options: CString,
-}
+impl ZludaObject for ModuleData {
+    #[cfg(target_pointer_width = "64")]
+    const LIVENESS_COOKIE: usize = 0xe522cee57bd3cd26;
+    #[cfg(target_pointer_width = "32")]
+    const LIVENESS_COOKIE: usize = 0x5f39cc5b;
+    const LIVENESS_FAIL: CUresult = CUresult::CUDA_ERROR_INVALID_HANDLE;
 
-impl SpirvModule {
-    pub fn new_raw<'a>(text: *const c_char) -> Result<Self, hipError_t> {
-        let u8_text = unsafe { CStr::from_ptr(text) };
-        let ptx_text = u8_text
-            .to_str()
-            .map_err(|_| hipError_t::hipErrorInvalidImage)?;
-        Self::new(ptx_text)
-    }
-
-    pub fn new<'a>(ptx_text: &str) -> Result<Self, hipError_t> {
-        let mut errors = Vec::new();
-        let ast = ptx::ModuleParser::new()
-            .parse(&mut errors, ptx_text)
-            .map_err(|_| hipError_t::hipErrorInvalidImage)?;
-        if errors.len() > 0 {
-            return Err(hipError_t::hipErrorInvalidImage);
-        }
-        let spirv_module =
-            ptx::to_spirv_module(ast).map_err(|_| hipError_t::hipErrorInvalidImage)?;
-        Ok(SpirvModule {
-            binaries: spirv_module.assemble(),
-            kernel_info: spirv_module.kernel_info,
-            should_link_ptx_impl: spirv_module.should_link_ptx_impl,
-            build_options: spirv_module.build_options,
-        })
-    }
-}
-
-pub(crate) fn load(module: *mut CUmodule, fname: *const i8) -> Result<(), hipError_t> {
-    let file_name = unsafe { CStr::from_ptr(fname) }
-        .to_str()
-        .map_err(|_| hipError_t::hipErrorInvalidValue)?;
-    let mut file = File::open(file_name).map_err(|_| hipError_t::hipErrorFileNotFound)?;
-    let mut file_buffer = Vec::new();
-    file.read_to_end(&mut file_buffer)
-        .map_err(|_| hipError_t::hipErrorUnknown)?;
-    let result = load_data(module, file_buffer.as_ptr() as _);
-    drop(file_buffer);
-    result
-}
-
-pub(crate) fn load_data(
-    module: *mut CUmodule,
-    image: *const std::ffi::c_void,
-) -> Result<(), hipError_t> {
-    if image == ptr::null() {
-        return Err(hipError_t::hipErrorInvalidValue);
-    }
-    if unsafe { *(image as *const u32) } == 0x464c457f {
-        return match unsafe { hipModuleLoadData(module as _, image) } {
-            hipError_t::hipSuccess => Ok(()),
-            e => Err(e),
-        };
-    }
-    let spirv_data = SpirvModule::new_raw(image as *const _)?;
-    load_data_impl(module, spirv_data)
-}
-
-pub fn load_data_impl(pmod: *mut CUmodule, spirv_data: SpirvModule) -> Result<(), hipError_t> {
-    let mut dev = 0;
-    hip_call! { hipCtxGetDevice(&mut dev) };
-    let mut props = unsafe { mem::zeroed() };
-    hip_call! { hipGetDeviceProperties(&mut props, dev) };
-    let arch_binary = compile_amd(
-        &props,
-        iter::once(&spirv_data.binaries[..]),
-        spirv_data.should_link_ptx_impl,
-    )
-    .map_err(|_| hipError_t::hipErrorUnknown)?;
-    hip_call! { hipModuleLoadData(pmod as _, arch_binary.as_ptr() as _) };
-    Ok(())
-}
-
-const LLVM_SPIRV: &'static str = "/home/vosen/amd/llvm-project/build/bin/llvm-spirv";
-const AMDGPU: &'static str = "/opt/rocm/";
-const AMDGPU_TARGET: &'static str = "amdgcn-amd-amdhsa";
-const AMDGPU_BITCODE: [&'static str; 8] = [
-    "opencl.bc",
-    "ocml.bc",
-    "ockl.bc",
-    "oclc_correctly_rounded_sqrt_off.bc",
-    "oclc_daz_opt_on.bc",
-    "oclc_finite_only_off.bc",
-    "oclc_unsafe_math_off.bc",
-    "oclc_wavefrontsize64_off.bc",
-];
-const AMDGPU_BITCODE_DEVICE_PREFIX: &'static str = "oclc_isa_version_";
-
-pub(crate) fn compile_amd<'a>(
-    device_pros: &hipDeviceProp_t,
-    spirv_il: impl Iterator<Item = &'a [u32]>,
-    ptx_lib: Option<(&'static [u8], &'static [u8])>,
-) -> io::Result<Vec<u8>> {
-    let null_terminator = device_pros
-        .gcnArchName
-        .iter()
-        .position(|&x| x == 0)
-        .unwrap();
-    let gcn_arch_slice = unsafe {
-        slice::from_raw_parts(device_pros.gcnArchName.as_ptr() as _, null_terminator + 1)
-    };
-    let device_name =
-        if let Ok(Ok(name)) = CStr::from_bytes_with_nul(gcn_arch_slice).map(|x| x.to_str()) {
-            name
+    fn drop_with_result(&mut self, by_owner: bool) -> Result<(), CUresult> {
+        let deregistration_err = if !by_owner {
+            if let Some(ctx) = self.owner {
+                let ctx = unsafe { LiveCheck::as_result(ctx.as_ptr())? };
+                ctx.with_inner_mut(|ctx_mutable| {
+                    ctx_mutable
+                        .modules
+                        .remove(&unsafe { LiveCheck::from_raw(self) });
+                })?;
+            }
+            Ok(())
         } else {
-            return Err(io::Error::new(io::ErrorKind::Other, ""));
+            Ok(())
         };
-    let dir = tempfile::tempdir()?;
-    let llvm_spirv_path = match env::var("LLVM_SPIRV") {
-        Ok(path) => Cow::Owned(path),
-        Err(_) => Cow::Borrowed(LLVM_SPIRV),
-    };
-    let llvm_files = spirv_il
-        .map(|spirv| {
-            let mut spirv_file = NamedTempFile::new_in(&dir)?;
-            let spirv_u8 = unsafe {
-                slice::from_raw_parts(
-                    spirv.as_ptr() as *const u8,
-                    spirv.len() * mem::size_of::<u32>(),
-                )
-            };
-            spirv_file.write_all(spirv_u8)?;
-            if cfg!(debug_assertions) {
-                persist_file(spirv_file.path())?;
-            }
-            let llvm = NamedTempFile::new_in(&dir)?;
-            let to_llvm_cmd = Command::new(&*llvm_spirv_path)
-                //.arg("--spirv-debug")
-                .arg("-r")
-                .arg("-o")
-                .arg(llvm.path())
-                .arg(spirv_file.path())
-                .status()?;
-            assert!(to_llvm_cmd.success());
-            if cfg!(debug_assertions) {
-                persist_file(llvm.path())?;
-            }
-            Ok::<_, io::Error>(llvm)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let linked_binary = NamedTempFile::new_in(&dir)?;
-    let mut llvm_link = PathBuf::from(AMDGPU);
-    llvm_link.push("llvm");
-    llvm_link.push("bin");
-    llvm_link.push("llvm-link");
-    let mut linker_cmd = Command::new(&llvm_link);
-    linker_cmd
-        .arg("-o")
-        .arg(linked_binary.path())
-        .args(llvm_files.iter().map(|f| f.path()))
-        .args(get_bitcode_paths(device_name));
-    if cfg!(debug_assertions) {
-        linker_cmd.arg("-v");
+        // Crashes HIP in 5.6 and 5.7.1
+        //deregistration_err.and(unsafe { hipModuleUnload(self.base) }.into_cuda().into())
+        deregistration_err
     }
-    let status = linker_cmd.status()?;
-    assert!(status.success());
-    if cfg!(debug_assertions) {
-        persist_file(linked_binary.path())?;
-    }
-    let mut ptx_lib_bitcode = NamedTempFile::new_in(&dir)?;
-    let compiled_binary = NamedTempFile::new_in(&dir)?;
-    let mut clang_exe = PathBuf::from(AMDGPU);
-    clang_exe.push("llvm");
-    clang_exe.push("bin");
-    clang_exe.push("clang");
-    let mut compiler_cmd = Command::new(&clang_exe);
-    compiler_cmd
-        .arg(format!("-mcpu={}", device_name))
-        .arg("-ffp-contract=off")
-        .arg("-nogpulib")
-        .arg("-mno-wavefrontsize64")
-        .arg("-O3")
-        .arg("-Xclang")
-        .arg("-O3")
-        .arg("-Xlinker")
-        .arg("--no-undefined")
-        .arg("-target")
-        .arg(AMDGPU_TARGET)
-        .arg("-o")
-        .arg(compiled_binary.path())
-        .arg("-x")
-        .arg("ir")
-        .arg(linked_binary.path());
-    if let Some((_, bitcode)) = ptx_lib {
-        ptx_lib_bitcode.write_all(bitcode)?;
-        compiler_cmd.arg(ptx_lib_bitcode.path());
-    };
-    if cfg!(debug_assertions) {
-        compiler_cmd.arg("-v");
-    }
-    let status = compiler_cmd.status()?;
-    assert!(status.success());
-    let mut result = Vec::new();
-    let compiled_bin_path = compiled_binary.path();
-    let mut compiled_binary = File::open(compiled_bin_path)?;
-    compiled_binary.read_to_end(&mut result)?;
-    if cfg!(debug_assertions) {
-        persist_file(compiled_bin_path)?;
-    }
-    Ok(result)
 }
 
-fn persist_file(path: &Path) -> io::Result<()> {
-    let mut persistent = PathBuf::from("/tmp/zluda");
-    std::fs::create_dir_all(&persistent)?;
-    persistent.push(path.file_name().unwrap());
-    std::fs::copy(path, persistent)?;
+pub(crate) struct ModuleData {
+    // If module is part of a library, then there's no owning context
+    pub(crate) owner: Option<NonNull<Context>>,
+    pub(crate) base: hipModule_t,
+    functions: Mutex<FxHashMap<CString, Box<function::Function>>>,
+    sm_version: u32,
+    device_version: u32,
+    hipfix_max_group_sizes: FxHashMap<CString, (u32, u32)>,
+    compilation_mode: CompilationMode,
+}
+
+impl ModuleData {
+    pub(crate) unsafe fn alloc(self) -> *mut Module {
+        Box::into_raw(Box::new(Module::new(self)))
+    }
+}
+
+pub(crate) unsafe fn load(module: *mut *mut Module, fname: *const i8) -> Result<(), CUresult> {
+    if fname == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    load_impl(module, CUmoduleContent::File(fname))
+}
+
+pub(crate) unsafe fn load_data(
+    module: *mut *mut Module,
+    image: *const ::std::os::raw::c_void,
+) -> Result<(), CUresult> {
+    if image == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    load_impl(
+        module,
+        CUmoduleContent::from_ptr(image.cast()).map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?,
+    )
+}
+
+pub(crate) unsafe fn load_impl(
+    output: *mut *mut Module,
+    input: CUmoduleContent,
+) -> Result<(), CUresult> {
+    if output == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    context::with_current(|ctx| {
+        let device = ctx.device;
+        let device = GLOBAL_STATE.get()?.device(device)?;
+        let isa = &device.comgr_isa;
+        let owner = LiveCheck::from_ref(ctx);
+        let module = ModuleData::alloc(load_data_any(
+            Some(owner),
+            device.compilation_mode,
+            isa,
+            input,
+        )?);
+        ctx.with_inner_mut(|ctx_mutable| {
+            ctx_mutable.modules.insert(module);
+        })?;
+        *output = module;
+        Ok(())
+    })?
+}
+
+unsafe fn link_build_or_load_cuda_module(
+    global_state: &super::GlobalState,
+    compilation_mode: CompilationMode,
+    isa: &CStr,
+    input: CUmoduleContent,
+) -> Result<Cow<'static, [u8]>, CUresult> {
+    match input {
+        CUmoduleContent::Elf(ptr) => Ok(Cow::Borrowed(hip_common::elf::as_slice(ptr))),
+        CUmoduleContent::Archive(..) => return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED),
+        CUmoduleContent::RawText(ptr) => {
+            let ptx = CStr::from_ptr(ptr.cast())
+                .to_str()
+                .map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?;
+            link_build_zluda_module(global_state, compilation_mode, isa, &[Cow::Borrowed(ptx)])
+                .map(Cow::Owned)
+        }
+        CUmoduleContent::File(file) => {
+            let name = CStr::from_ptr(file)
+                .to_str()
+                .map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?;
+            let ptx =
+                std::fs::read_to_string(name).map_err(|_| CUresult::CUDA_ERROR_INVALID_VALUE)?;
+            link_build_zluda_module(global_state, compilation_mode, isa, &[Cow::Owned(ptx)])
+                .map(Cow::Owned)
+        }
+        CUmoduleContent::Fatbin(files) => match files {
+            zluda_dark_api::CudaFatbin::Version1(module) => {
+                link_build_or_load_fatbin_module(global_state, compilation_mode, isa, module)
+                    .map(Cow::Owned)
+            }
+            zluda_dark_api::CudaFatbin::Version2 {
+                post_link,
+                pre_link,
+            } => {
+                if let Ok(binary) =
+                    link_build_or_load_fatbin_module(global_state, compilation_mode, isa, post_link)
+                {
+                    return Ok(Cow::Owned(binary));
+                }
+                let ptx_files = pre_link
+                    .iter()
+                    .map(|module| {
+                        let module = unsafe { module.get() }
+                            .map_err(|_| CUresult::CUDA_ERROR_NOT_SUPPORTED)?;
+                        match module {
+                            zluda_dark_api::FatbinModule::Elf(_) => {
+                                return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED);
+                            }
+                            zluda_dark_api::FatbinModule::Files(files) => {
+                                let ptx_files = extract_ptx(files);
+                                if ptx_files.is_empty() {
+                                    return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED);
+                                }
+                                Ok(ptx_files.into_iter().next().unwrap().0)
+                            }
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                link_build_zluda_module(global_state, compilation_mode, isa, &*ptx_files)
+                    .map(Cow::Owned)
+            }
+        },
+    }
+}
+
+fn link_build_or_load_fatbin_module(
+    global_state: &super::GlobalState,
+    compilation_mode: CompilationMode,
+    isa: &CStr,
+    module: zluda_dark_api::FatbinModuleHandle,
+) -> Result<Vec<u8>, CUresult> {
+    let module = unsafe { module.get() }.map_err(|_| CUresult::CUDA_ERROR_NOT_SUPPORTED)?;
+    match module {
+        zluda_dark_api::FatbinModule::Elf(_) => {
+            return Err(CUresult::CUDA_ERROR_NOT_SUPPORTED);
+        }
+        zluda_dark_api::FatbinModule::Files(files) => {
+            let ptx_files = extract_ptx(files);
+            for (ptx, _) in ptx_files {
+                if let Ok(binary) =
+                    link_build_zluda_module(global_state, compilation_mode, isa, &[ptx])
+                {
+                    return Ok(binary);
+                }
+            }
+            Err(CUresult::CUDA_ERROR_NOT_SUPPORTED)
+        }
+    }
+}
+
+fn extract_ptx(files: zluda_dark_api::FatbinModuleFiles) -> Vec<(Cow<'static, str>, u32)> {
+    let mut ptx_files = files
+        .filter_map(|file| {
+            file.ok()
+                .map(|file| {
+                    if file.kind == FatbinFileKind::Ptx {
+                        unsafe { file.get_or_decompress() }
+                            .ok()
+                            .map(|f| {
+                                // TODO: implement support for envreg
+                                // %envreg is currently used by global grid sync in PETSc on never CUDA architectures:
+                                //  auto g = cooperative_groups::this_grid();
+                                //  g.sync();
+                                if memchr::memmem::find(&*f, b"%envreg").is_some() {
+                                    return None;
+                                }
+                                let text = match f {
+                                    Cow::Borrowed(slice) => {
+                                        Cow::Borrowed(std::str::from_utf8(slice).ok()?)
+                                    }
+                                    Cow::Owned(vec) => Cow::Owned(String::from_utf8(vec).ok()?),
+                                };
+                                Some((text, file.sm_version))
+                            })
+                            .flatten()
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    ptx_files.sort_unstable_by_key(|(_, sm_version)| cmp::Reverse(*sm_version));
+    ptx_files
+}
+
+pub(crate) unsafe fn load_data_any(
+    owner: Option<NonNull<Context>>,
+    compilation_mode: CompilationMode,
+    isa: &CStr,
+    input: CUmoduleContent,
+) -> Result<ModuleData, CUresult> {
+    let global_state = GLOBAL_STATE.get()?;
+    let gpu_module = link_build_or_load_cuda_module(global_state, compilation_mode, isa, input)?;
+    let (hipfix_max_group_sizes, sm_version) = load_kernel_metadata(&*gpu_module)?;
+    let mut hip_module = ptr::null_mut();
+    hip_call_cuda! { hipModuleLoadData(&mut hip_module, gpu_module.as_ptr() as _) };
+    let device_version = device::COMPUTE_CAPABILITY_MAJOR * 10 + device::COMPUTE_CAPABILITY_MINOR;
+    Ok(ModuleData {
+        compilation_mode,
+        base: hip_module,
+        owner,
+        device_version,
+        sm_version,
+        hipfix_max_group_sizes,
+        functions: Mutex::new(FxHashMap::default()),
+    })
+}
+
+fn load_kernel_metadata(
+    gpu_module: &[u8],
+) -> Result<(FxHashMap<CString, (u32, u32)>, u32), CUresult> {
+    let zluda_rt_section = hip_common::kernel_metadata::get_section(
+        hip_common::kernel_metadata::zluda::SECTION_STR,
+        gpu_module,
+    )
+    .ok_or(CUresult::CUDA_ERROR_UNKNOWN)?;
+    let mut hipfix_max_group_sizes = FxHashMap::default();
+    let sm_version =
+        hip_common::kernel_metadata::zluda::read(zluda_rt_section, |name, mut min, mut max| {
+            if min == 0 && max == 0 {
+                return;
+            }
+            if min == 0 {
+                min = 1;
+            }
+            if max == 0 {
+                max = u32::MAX;
+            }
+            if let Ok(name) = CString::new(name) {
+                hipfix_max_group_sizes.insert(name, (min, max));
+            }
+        })
+        .map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
+    Ok((hipfix_max_group_sizes, sm_version))
+}
+
+pub(crate) fn link_build_zluda_module(
+    global_state: &super::GlobalState,
+    compilation_mode: CompilationMode,
+    isa: &CStr,
+    ptx_text: &[Cow<'_, str>],
+) -> Result<Vec<u8>, CUresult> {
+    if ptx_text.is_empty() {
+        return Err(CUresult::CUDA_ERROR_UNKNOWN);
+    }
+    if let Some(ref cache) = global_state.kernel_cache {
+        if let Some(binary) =
+            cache.try_load_program(&global_state.comgr_version, isa, ptx_text, compilation_mode)
+        {
+            return Ok(binary);
+        }
+    }
+    // Older CUDA applications have no notion of lazy loading
+    // and will eager load everything even if the module is unused.
+    // For this reason we fallback to empty module since that has potential
+    // to enable a few applications (but only in release mode)
+    let asts = ptx_text
+        .iter()
+        .map(|ptx_mod| {
+            let mut module = ptx::ModuleParser::parse_checked(&*ptx_mod);
+            if !cfg!(debug_assertions) {
+                module = module.or_else(|_| ptx::ModuleParser::parse_checked(EMPTY_MODULE))
+            }
+            module
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| CUresult::CUDA_ERROR_INVALID_PTX)?;
+    let mut llvm_module = ptx::to_llvm_module(compilation_mode, asts);
+    if !cfg!(debug_assertions) {
+        llvm_module = llvm_module.or_else(|_| {
+            ptx::to_llvm_module(
+                compilation_mode,
+                vec![ptx::ModuleParser::parse_checked(EMPTY_MODULE)
+                    .map_err(|_| ptx::TranslateError::Todo)?],
+            )
+        });
+    }
+    let llvm_module = llvm_module.map_err(|_| CUresult::CUDA_ERROR_INVALID_PTX)?;
+    let binary = global_state
+        .comgr
+        .compile(
+            compilation_mode,
+            isa,
+            ptx::Module::get_bitcode_multi(std::iter::once(&llvm_module)).into_iter(),
+            &llvm_module.metadata.to_elf_section(),
+        )
+        .map_err(comgr_error_to_cuda)?;
+    if let Some(ref cache) = global_state.kernel_cache {
+        cache.save_program(
+            &global_state.comgr_version,
+            isa,
+            ptx_text,
+            compilation_mode,
+            &binary,
+        );
+    }
+    Ok(binary)
+}
+
+pub(crate) unsafe fn unload(hmod: *mut Module) -> Result<(), CUresult> {
+    if hmod == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    let module = LiveCheck::as_result(hmod)?;
+    if module.owner.is_none() {
+        return Err(CUresult::CUDA_ERROR_NOT_PERMITTED);
+    }
+    LiveCheck::drop_box_with_result(hmod, false)
+}
+
+pub(crate) unsafe fn get_function(
+    hfunc: *mut *mut function::Function,
+    hmod: *mut Module,
+    name: *const i8,
+) -> Result<(), CUresult> {
+    if hfunc == ptr::null_mut() || hmod == ptr::null_mut() || name == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    let module = LiveCheck::as_result(hmod)?;
+    let name = CStr::from_ptr(name).to_owned();
+    let mut functions = module
+        .functions
+        .lock()
+        .map_err(|_| CUresult::CUDA_ERROR_UNKNOWN)?;
+    let function = match functions.entry(name.to_owned()) {
+        hash_map::Entry::Occupied(entry) => {
+            let function: &function::Function = &*entry.get();
+            function as *const function::Function as *mut _
+        }
+        hash_map::Entry::Vacant(entry) => {
+            let mut hip_func = ptr::null_mut();
+            hip_call_cuda!(hipModuleGetFunction(
+                &mut hip_func,
+                module.base,
+                name.as_ptr() as _
+            ));
+            let function: &function::Function =
+                &*entry.insert(Box::new(LiveCheck::new(FunctionData {
+                    base: hip_func,
+                    binary_version: module.device_version,
+                    ptx_version: module.sm_version,
+                    group_size: module.hipfix_max_group_sizes.get(&name).copied(),
+                    compilation_mode: module.compilation_mode,
+                })));
+            function as *const function::Function as *mut _
+        }
+    };
+    *hfunc = function;
     Ok(())
 }
 
-fn get_bitcode_paths(device_name: &str) -> impl Iterator<Item = PathBuf> {
-    let generic_paths = AMDGPU_BITCODE.iter().map(|x| {
-        let mut path = PathBuf::from(AMDGPU);
-        path.push("amdgcn");
-        path.push("bitcode");
-        path.push(x);
-        path
-    });
-    let suffix = if let Some(suffix_idx) = device_name.find(':') {
-        suffix_idx
-    } else {
-        device_name.len()
-    };
-    let mut additional_path = PathBuf::from(AMDGPU);
-    additional_path.push("amdgcn");
-    additional_path.push("bitcode");
-    additional_path.push(format!(
-        "{}{}{}",
-        AMDGPU_BITCODE_DEVICE_PREFIX,
-        &device_name[3..suffix],
-        ".bc"
+pub(crate) unsafe fn get_global(
+    dptr: *mut hipDeviceptr_t,
+    bytes: *mut usize,
+    hmod: *mut Module,
+    name: *const i8,
+) -> Result<(), CUresult> {
+    if (dptr == ptr::null_mut() && bytes == ptr::null_mut()) || name == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_VALUE);
+    }
+    if hmod == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);
+    }
+    let hip_module = LiveCheck::as_result(hmod)?.base;
+    hip_call_cuda!(hipfix::module_get_global(dptr, bytes, hip_module, name));
+    Ok(())
+}
+
+pub(crate) unsafe fn get_tex_ref(
+    tex_ref: *mut *mut textureReference,
+    hmod: *mut Module,
+    name: *const i8,
+) -> Result<(), CUresult> {
+    if tex_ref == ptr::null_mut() || hmod == ptr::null_mut() || name == ptr::null_mut() {
+        return Err(CUresult::CUDA_ERROR_INVALID_HANDLE);
+    }
+    let hip_module = LiveCheck::as_result(hmod)?.base;
+    hip_call_cuda!(hipModuleGetTexRef(tex_ref, hip_module, name));
+    hip_call_cuda!(hipTexRefSetFormat(
+        *tex_ref,
+        hipArray_Format::HIP_AD_FORMAT_FLOAT,
+        1
     ));
-    generic_paths.chain(std::iter::once(additional_path))
+    Ok(())
+}
+
+const HIP_TRSF_READ_AS_INTEGER: u32 = 1;
+
+pub(crate) unsafe fn get_surf_ref(
+    texref: *mut *mut textureReference,
+    hmod: *mut Module,
+    name: *const i8,
+) -> Result<(), CUresult> {
+    get_tex_ref(texref, hmod, name)?;
+    hip_call_cuda!(hipTexRefSetFlags(*texref, HIP_TRSF_READ_AS_INTEGER));
+    Ok(())
+}
+
+pub(crate) unsafe fn get_loading_mode(result: *mut CUmoduleLoadingMode) -> CUresult {
+    if result == ptr::null_mut() {
+        CUresult::CUDA_ERROR_INVALID_VALUE
+    } else {
+        let mode = if matches!(std::env::var("CUDA_MODULE_LOADING").as_deref(), Ok("EAGER")) {
+            CUmoduleLoadingMode::CU_MODULE_EAGER_LOADING
+        } else {
+            CUmoduleLoadingMode::CU_MODULE_LAZY_LOADING
+        };
+        *result = mode;
+        CUresult::CUDA_SUCCESS
+    }
 }

@@ -25,19 +25,29 @@ use winapi::um::winbase::{INFINITE, WAIT_FAILED};
 static REDIRECT_DLL: &'static str = "zluda_redirect.dll";
 static NVCUDA_DLL: &'static str = "nvcuda.dll";
 static NVML_DLL: &'static str = "nvml.dll";
+static NVAPI_DLL: &'static str = "nvapi64.dll";
+static NVOPTIX_DLL: &'static str = "optix.6.6.0.dll";
 
 include!("../../zluda_redirect/src/payload_guid.rs");
 
 #[derive(FromArgs)]
 /// Launch application with custom CUDA libraries
 struct ProgramArguments {
-    /// DLL to be injected instead of system nvcuda.dll. If not provided {0} will use nvcuda.dll from its directory
+    /// DLL to be injected instead of system nvcuda.dll. If not provided {0}, will use nvcuda.dll from its own directory
     #[argh(option)]
     nvcuda: Option<PathBuf>,
 
-    /// DLL to be injected instead of system nvml.dll. If not provided {0} will use nvml.dll from its directory
+    /// DLL to be injected instead of system nvml.dll. If not provided {0}, will use nvml.dll from its own directory
     #[argh(option)]
     nvml: Option<PathBuf>,
+
+    /// DLL to be injected instead of system nvapi64.dll. If not provided, no injection will take place
+    #[argh(option)]
+    nvapi: Option<PathBuf>,
+
+    /// DLL to be injected instead of system nvoptix.dll. If not provided, no injection will take place
+    #[argh(option)]
+    nvoptix: Option<PathBuf>,
 
     /// executable to be injected with custom CUDA libraries
     #[argh(positional)]
@@ -54,11 +64,17 @@ pub fn main_impl() -> Result<(), Box<dyn Error>> {
     let mut environment = Environment::setup(normalized_args)?;
     let mut startup_info = unsafe { mem::zeroed::<detours_sys::_STARTUPINFOW>() };
     let mut proc_info = unsafe { mem::zeroed::<detours_sys::_PROCESS_INFORMATION>() };
-    let mut dlls_to_inject = [
-        environment.nvml_path_zero_terminated.as_ptr() as *const i8,
+    let mut dlls_to_inject = vec![
         environment.nvcuda_path_zero_terminated.as_ptr() as _,
+        environment.nvml_path_zero_terminated.as_ptr() as *const i8,
         environment.redirect_path_zero_terminated.as_ptr() as _,
     ];
+    if let Some(ref nvapi) = environment.nvapi_path_zero_terminated {
+        dlls_to_inject.push(nvapi.as_ptr() as _);
+    }
+    if let Some(ref nvoptix) = environment.nvoptix_path_zero_terminated {
+        dlls_to_inject.push(nvoptix.as_ptr() as _);
+    }
     os_call!(
         detours_sys::DetourCreateProcessWithDllsW(
             ptr::null(),
@@ -96,6 +112,28 @@ pub fn main_impl() -> Result<(), Box<dyn Error>> {
         ),
         |x| x != 0
     );
+    if let Some(nvapi) = environment.nvapi_path_zero_terminated {
+        os_call!(
+            detours_sys::DetourCopyPayloadToProcess(
+                proc_info.hProcess,
+                &PAYLOAD_NVAPI_GUID,
+                nvapi.as_ptr() as *mut _,
+                nvapi.len() as u32
+            ),
+            |x| x != 0
+        );
+    }
+    if let Some(nvoptix) = environment.nvoptix_path_zero_terminated {
+        os_call!(
+            detours_sys::DetourCopyPayloadToProcess(
+                proc_info.hProcess,
+                &PAYLOAD_NVOPTIX_GUID,
+                nvoptix.as_ptr() as *mut _,
+                nvoptix.len() as u32
+            ),
+            |x| x != 0
+        );
+    }
     os_call!(ResumeThread(proc_info.hThread), |x| x as i32 != -1);
     os_call!(WaitForSingleObject(proc_info.hProcess, INFINITE), |x| x
         != WAIT_FAILED);
@@ -108,8 +146,10 @@ pub fn main_impl() -> Result<(), Box<dyn Error>> {
 }
 
 struct NormalizedArguments {
-    nvml_path: PathBuf,
     nvcuda_path: PathBuf,
+    nvml_path: PathBuf,
+    nvapi_path: Option<PathBuf>,
+    nvoptix_path: Option<PathBuf>,
     redirect_path: PathBuf,
     winapi_command_line_zero_terminated: Vec<u16>,
 }
@@ -117,15 +157,20 @@ struct NormalizedArguments {
 impl NormalizedArguments {
     fn new(prog_args: ProgramArguments) -> Result<Self, Box<dyn Error>> {
         let current_exe = env::current_exe()?;
-        let nvml_path = Self::get_absolute_path(&current_exe, prog_args.nvml, NVML_DLL)?;
-        let nvcuda_path = Self::get_absolute_path(&current_exe, prog_args.nvcuda, NVCUDA_DLL)?;
+        let nvcuda_path =
+            Self::get_absolute_path_or_default(&current_exe, prog_args.nvcuda, NVCUDA_DLL)?;
+        let nvml_path = Self::get_absolute_path_or_default(&current_exe, prog_args.nvml, NVML_DLL)?;
+        let nvapi_path = prog_args.nvapi.map(Self::get_absolute_path).transpose()?;
+        let nvoptix_path = prog_args.nvoptix.map(Self::get_absolute_path).transpose()?;
         let winapi_command_line_zero_terminated =
             construct_command_line(std::iter::once(prog_args.exe).chain(prog_args.args));
         let mut redirect_path = current_exe.parent().unwrap().to_path_buf();
         redirect_path.push(REDIRECT_DLL);
         Ok(Self {
-            nvml_path,
             nvcuda_path,
+            nvml_path,
+            nvapi_path,
+            nvoptix_path,
             redirect_path,
             winapi_command_line_zero_terminated,
         })
@@ -133,75 +178,101 @@ impl NormalizedArguments {
 
     const WIN_MAX_PATH: usize = 260;
 
-    fn get_absolute_path(
+    fn get_absolute_path_or_default(
         current_exe: &PathBuf,
         dll: Option<PathBuf>,
         default: &str,
     ) -> Result<PathBuf, Box<dyn Error>> {
-        Ok(if let Some(dll) = dll {
-            if dll.is_absolute() {
-                dll
-            } else {
-                let mut full_dll_path = vec![0; Self::WIN_MAX_PATH];
-                let mut dll_utf16 = dll.as_os_str().encode_wide().collect::<Vec<_>>();
-                dll_utf16.push(0);
-                loop {
-                    let copied_len = os_call!(
-                        SearchPathW(
-                            ptr::null_mut(),
-                            dll_utf16.as_ptr(),
-                            ptr::null(),
-                            full_dll_path.len() as u32,
-                            full_dll_path.as_mut_ptr(),
-                            ptr::null_mut()
-                        ),
-                        |x| x != 0
-                    ) as usize;
-                    if copied_len > full_dll_path.len() {
-                        full_dll_path.resize(copied_len + 1, 0);
-                    } else {
-                        full_dll_path.truncate(copied_len);
-                        break;
-                    }
-                }
-                PathBuf::from(String::from_utf16_lossy(&full_dll_path))
-            }
+        if let Some(dll) = dll {
+            Self::get_absolute_path(dll)
         } else {
             let mut dll_path = current_exe.parent().unwrap().to_path_buf();
             dll_path.push(default);
-            dll_path
+            Ok(dll_path)
+        }
+    }
+
+    fn get_absolute_path(dll: PathBuf) -> Result<PathBuf, Box<dyn Error>> {
+        Ok(if dll.is_absolute() {
+            dll
+        } else {
+            let mut full_dll_path = vec![0; Self::WIN_MAX_PATH];
+            let mut dll_utf16 = dll.as_os_str().encode_wide().collect::<Vec<_>>();
+            dll_utf16.push(0);
+            loop {
+                let copied_len = os_call!(
+                    SearchPathW(
+                        ptr::null_mut(),
+                        dll_utf16.as_ptr(),
+                        ptr::null(),
+                        full_dll_path.len() as u32,
+                        full_dll_path.as_mut_ptr(),
+                        ptr::null_mut()
+                    ),
+                    |x| x != 0
+                ) as usize;
+                if copied_len > full_dll_path.len() {
+                    full_dll_path.resize(copied_len + 1, 0);
+                } else {
+                    full_dll_path.truncate(copied_len);
+                    break;
+                }
+            }
+            PathBuf::from(String::from_utf16_lossy(&full_dll_path))
         })
     }
 }
 
 struct Environment {
-    nvml_path_zero_terminated: String,
     nvcuda_path_zero_terminated: String,
+    nvml_path_zero_terminated: String,
+    nvapi_path_zero_terminated: Option<String>,
+    nvoptix_path_zero_terminated: Option<String>,
     redirect_path_zero_terminated: String,
     winapi_command_line_zero_terminated: Vec<u16>,
     _temp_dir: TempDir,
 }
 
-// This structs represents "enviroment". By environment we mean all paths
+// This structs represents "environment". By environment we mean all paths
 // (nvcuda.dll, nvml.dll, etc.) and all related resources like the temporary
 // directory which contains nvcuda.dll
 impl Environment {
     fn setup(args: NormalizedArguments) -> io::Result<Self> {
         let _temp_dir = TempDir::new()?;
-        let nvml_path_zero_terminated = Self::zero_terminate(Self::copy_to_correct_name(
-            args.nvml_path,
-            &_temp_dir,
-            NVML_DLL,
-        )?);
         let nvcuda_path_zero_terminated = Self::zero_terminate(Self::copy_to_correct_name(
             args.nvcuda_path,
             &_temp_dir,
             NVCUDA_DLL,
         )?);
+        let nvml_path_zero_terminated = Self::zero_terminate(Self::copy_to_correct_name(
+            args.nvml_path,
+            &_temp_dir,
+            NVML_DLL,
+        )?);
+        let nvapi_path_zero_terminated = args
+            .nvapi_path
+            .map(|nvapi| {
+                Ok::<_, io::Error>(Self::zero_terminate(Self::copy_to_correct_name(
+                    nvapi, &_temp_dir, NVAPI_DLL,
+                )?))
+            })
+            .transpose()?;
+        let nvoptix_path_zero_terminated = args
+            .nvoptix_path
+            .map(|nvoptix| {
+                Ok::<_, io::Error>(Self::zero_terminate(Self::copy_to_correct_name(
+                    nvoptix,
+                    &_temp_dir,
+                    NVOPTIX_DLL,
+                )?))
+            })
+            .transpose()?;
         let redirect_path_zero_terminated = Self::zero_terminate(args.redirect_path);
         Ok(Self {
-            nvml_path_zero_terminated,
             nvcuda_path_zero_terminated,
+            nvml_path_zero_terminated,
+            nvapi_path_zero_terminated,
+            nvoptix_path_zero_terminated,
             redirect_path_zero_terminated,
             winapi_command_line_zero_terminated: args.winapi_command_line_zero_terminated,
             _temp_dir,

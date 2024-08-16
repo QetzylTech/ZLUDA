@@ -1,19 +1,19 @@
 extern crate proc_macro;
 
-use std::collections::hash_map;
-use std::iter;
-
 use proc_macro::TokenStream;
 use proc_macro2::Span;
 use quote::{format_ident, quote, ToTokens};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::hash_map;
+use std::iter;
 use syn::parse::{Parse, ParseStream};
 use syn::punctuated::Punctuated;
+use syn::visit::Visit;
 use syn::visit_mut::VisitMut;
 use syn::{
     bracketed, parse_macro_input, Abi, Fields, File, FnArg, ForeignItem, ForeignItemFn, Ident,
-    Item, ItemForeignMod, LitStr, PatType, Path, PathArguments, PathSegment, ReturnType, Signature,
-    Token, Type, TypeArray, TypePath, TypePtr,
+    Item, ItemEnum, ItemForeignMod, ItemStruct, ItemUnion, LitStr, PatType, Path, PathArguments,
+    PathSegment, ReturnType, Signature, Token, Type, TypeArray, TypePath, TypePtr,
 };
 
 const CUDA_RS: &'static str = include_str! {"cuda.rs"};
@@ -23,6 +23,11 @@ const CUDA_RS: &'static str = include_str! {"cuda.rs"};
 // * CUdeviceptr_v2 is redefined from `unsigned long long` to `*void`
 // * `extern "C"` gets replaced by `extern "system"`
 // * CUuuid_st is redefined to use uchar instead of char
+// * Every type except anything graph-related is marked as Send and Sync
+// TODO: Improve Send/Sync generation. Currently types that are defined as
+//       pointers (which is 99% of useful types) can't be marked as Send&Sync
+//       Their definition should be changed to newtype with a null() function
+//       and all code should be updated accordingly
 #[proc_macro]
 pub fn cuda_type_declarations(_: TokenStream) -> TokenStream {
     let mut cuda_module = syn::parse_str::<File>(CUDA_RS).unwrap();
@@ -59,8 +64,24 @@ pub fn cuda_type_declarations(_: TokenStream) -> TokenStream {
             i => Some(i),
         })
         .collect::<Vec<_>>();
+    mark_types_as_send_sync(&mut cuda_module);
     syn::visit_mut::visit_file_mut(&mut FixAbi, &mut cuda_module);
     cuda_module.into_token_stream().into()
+}
+
+fn mark_types_as_send_sync(cuda_module: &mut File) {
+    let mut types_for_send_sync = CollectTypesForSendSync { types: Vec::new() };
+    syn::visit::visit_file(&mut types_for_send_sync, &cuda_module);
+    for type_ in types_for_send_sync.types {
+        let send: Item = syn::parse_quote! {
+            unsafe impl Send for #type_ {}
+        };
+        cuda_module.items.push(send);
+        let sync: Item = syn::parse_quote! {
+            unsafe impl Sync for #type_ {}
+        };
+        cuda_module.items.push(sync);
+    }
 }
 
 fn segments_to_path(path: &[&'static str]) -> Path {
@@ -97,6 +118,35 @@ impl VisitMut for FixAbi {
         if let Some(ref mut name) = i.name {
             *name = LitStr::new("system", Span::call_site());
         }
+    }
+}
+
+struct CollectTypesForSendSync {
+    types: Vec<Ident>,
+}
+
+impl CollectTypesForSendSync {
+    fn try_add(&mut self, ident: &Ident) {
+        let mut name = ident.to_string();
+        name.make_ascii_lowercase();
+        if name.contains("graph") {
+            return;
+        }
+        self.types.push(ident.clone());
+    }
+}
+
+impl<'ast> Visit<'ast> for CollectTypesForSendSync {
+    fn visit_item_struct(&mut self, item_struct: &'ast ItemStruct) {
+        self.try_add(&item_struct.ident);
+    }
+
+    fn visit_item_union(&mut self, item_struct: &'ast ItemUnion) {
+        self.try_add(&item_struct.ident);
+    }
+
+    fn visit_item_enum(&mut self, item_struct: &'ast ItemEnum) {
+        self.try_add(&item_struct.ident);
     }
 }
 

@@ -6,3 +6,6 @@ edition = "2018"
 links = "amdhip"
 
 [lib]
+
+[dependencies]
+rustc-hash = "1.1"

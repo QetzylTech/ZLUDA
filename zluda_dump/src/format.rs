@@ -1,3 +1,4 @@
+use cuda_types::*;
 use std::{
     ffi::{c_void, CStr},
     fmt::LowerHex,
@@ -23,7 +24,7 @@ impl CudaDisplay for cuda_types::CUuuid {
         writer: &mut (impl std::io::Write + ?Sized),
     ) -> std::io::Result<()> {
         let guid = self.bytes;
-        write!(writer, "{{{:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}", guid[0], guid[1], guid[2], guid[3], guid[4], guid[5], guid[6], guid[7], guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15])
+        write!(writer, "{{{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}", guid[3], guid[2], guid[1], guid[0], guid[5], guid[4], guid[7], guid[6], guid[8], guid[9], guid[10], guid[11], guid[12], guid[13], guid[14], guid[15])
     }
 }
 
@@ -210,11 +211,15 @@ impl CudaDisplay for *const i8 {
         _index: usize,
         writer: &mut (impl std::io::Write + ?Sized),
     ) -> std::io::Result<()> {
-        write!(
-            writer,
-            "\"{}\"",
-            unsafe { CStr::from_ptr(*self as _) }.to_string_lossy()
-        )
+        if *self == ptr::null_mut() {
+            writer.write_all(b"NULL")
+        } else {
+            write!(
+                writer,
+                "\"{}\"",
+                unsafe { CStr::from_ptr(*self as _) }.to_string_lossy()
+            )
+        }
     }
 }
 
@@ -504,10 +509,51 @@ impl<T: CudaDisplay> CudaDisplay for *mut T {
         if *self == ptr::null_mut() {
             writer.write_all(b"NULL")
         } else {
-            let this: &T = unsafe { &**self };
-            this.write(fn_name, index, writer)
+            if fn_name == "cuLaunchKernel" && index == 9 {
+                unsafe { write_launch_kernel_extra(*self as *mut *mut c_void, writer) }
+            } else {
+                let this: &T = unsafe { &**self };
+                this.write(fn_name, index, writer)
+            }
         }
     }
+}
+
+unsafe fn write_launch_kernel_extra(
+    mut extra: *mut *mut c_void,
+    writer: &mut (impl std::io::Write + ?Sized),
+) -> std::io::Result<()> {
+    writer.write_all(b"[")?;
+    let mut format_as_size = false;
+    loop {
+        let ptr = *extra;
+        match ptr as usize {
+            0 => {
+                writer.write_all(b"CU_LAUNCH_PARAM_END")?;
+                break;
+            }
+            1 => {
+                writer.write_all(b"CU_LAUNCH_PARAM_BUFFER_POINTER")?;
+            }
+            2 => {
+                writer.write_all(b"CU_LAUNCH_PARAM_BUFFER_SIZE")?;
+                format_as_size = true;
+            }
+            _ => {
+                if format_as_size {
+                    let size = *(ptr as *mut usize);
+                    write!(writer, "{}", size)?;
+                    format_as_size = false;
+                } else {
+                    write!(writer, "{:p}", ptr)?;
+                }
+            }
+        }
+        writer.write_all(b", ")?;
+        extra = extra.offset(1);
+    }
+    writer.write_all(b"]")?;
+    Ok(())
 }
 
 impl<T: CudaDisplay> CudaDisplay for *const T {
@@ -544,6 +590,46 @@ impl<T: CudaDisplay, const N: usize> CudaDisplay for [T; N] {
     }
 }
 
+impl<const N: usize> CudaDisplay for [i8; N] {
+    fn write(
+        &self,
+        _fn_name: &'static str,
+        _index: usize,
+        writer: &mut (impl std::io::Write + ?Sized),
+    ) -> std::io::Result<()> {
+        writer.write_all(b"[")?;
+        for i in 0..N {
+            write!(writer, "{}", self[i])?;
+            if i != N - 1 {
+                writer.write_all(b", ")?;
+            }
+        }
+        writer.write_all(b"]")
+    }
+}
+
+impl CudaDisplay for cuda_types::CUgraphNodeParams {
+    fn write(
+        &self,
+        _fn_name: &'static str,
+        _index: usize,
+        _writer: &mut (impl std::io::Write + ?Sized),
+    ) -> std::io::Result<()> {
+        todo!()
+    }
+}
+
+impl CudaDisplay for cuda_types::CUlaunchAttribute_st {
+    fn write(
+        &self,
+        _fn_name: &'static str,
+        _index: usize,
+        _writer: &mut (impl std::io::Write + ?Sized),
+    ) -> std::io::Result<()> {
+        todo!()
+    }
+}
+
 #[allow(non_snake_case)]
 pub fn write_cuStreamBatchMemOp(
     writer: &mut (impl std::io::Write + ?Sized),
@@ -571,14 +657,14 @@ pub fn write_cuStreamBatchMemOp(
     }
     writer.write_all(b"], flags: ")?;
     CudaDisplay::write(&flags, "cuStreamBatchMemOp", 3, writer)?;
-    writer.write_all(b") ")
+    writer.write_all(b")")
 }
 
 #[allow(non_snake_case)]
 pub fn write_cuGraphKernelNodeGetAttribute(
     writer: &mut (impl std::io::Write + ?Sized),
     hNode: cuda_types::CUgraphNode,
-    attr: cuda_types::CUkernelNodeAttrID,
+    attr: cuda_types::CUlaunchAttributeID,
     value_out: *mut cuda_types::CUkernelNodeAttrValue,
 ) -> std::io::Result<()> {
     writer.write_all(b"(hNode: ")?;
@@ -586,7 +672,7 @@ pub fn write_cuGraphKernelNodeGetAttribute(
     writer.write_all(b", attr: ")?;
     CudaDisplay::write(&attr, "cuGraphKernelNodeGetAttribute", 1, writer)?;
     match attr {
-        cuda_types::CUkernelNodeAttrID::CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW => {
+        cuda_types::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW => {
             writer.write_all(b", value_out: ")?;
             CudaDisplay::write(
                 unsafe { &(*value_out).accessPolicyWindow },
@@ -595,7 +681,7 @@ pub fn write_cuGraphKernelNodeGetAttribute(
                 writer,
             )?;
         }
-        cuda_types::CUkernelNodeAttrID::CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE => {
+        cuda_types::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_COOPERATIVE => {
             writer.write_all(b", value_out: ")?;
             CudaDisplay::write(
                 unsafe { &(*value_out).cooperative },
@@ -606,14 +692,14 @@ pub fn write_cuGraphKernelNodeGetAttribute(
         }
         _ => return writer.write_all(b", ...) "),
     }
-    writer.write_all(b") ")
+    writer.write_all(b")")
 }
 
 #[allow(non_snake_case)]
 pub fn write_cuGraphKernelNodeSetAttribute(
     writer: &mut (impl std::io::Write + ?Sized),
     hNode: cuda_types::CUgraphNode,
-    attr: cuda_types::CUkernelNodeAttrID,
+    attr: cuda_types::CUlaunchAttributeID,
     value_out: *const cuda_types::CUkernelNodeAttrValue,
 ) -> std::io::Result<()> {
     write_cuGraphKernelNodeGetAttribute(writer, hNode, attr, value_out as *mut _)
@@ -631,7 +717,7 @@ pub fn write_cuStreamGetAttribute(
     writer.write_all(b", attr: ")?;
     CudaDisplay::write(&attr, "cuStreamGetAttribute", 1, writer)?;
     match attr {
-        cuda_types::CUstreamAttrID::CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW => {
+        cuda_types::CUstreamAttrID::CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW => {
             writer.write_all(b", value_out: ")?;
             CudaDisplay::write(
                 unsafe { &(*value_out).accessPolicyWindow },
@@ -640,7 +726,7 @@ pub fn write_cuStreamGetAttribute(
                 writer,
             )?;
         }
-        cuda_types::CUstreamAttrID::CU_STREAM_ATTRIBUTE_SYNCHRONIZATION_POLICY => {
+        cuda_types::CUstreamAttrID::CU_LAUNCH_ATTRIBUTE_SYNCHRONIZATION_POLICY => {
             writer.write_all(b", value_out: ")?;
             CudaDisplay::write(
                 unsafe { &(*value_out).syncPolicy },
@@ -651,7 +737,7 @@ pub fn write_cuStreamGetAttribute(
         }
         _ => return writer.write_all(b", ...) "),
     }
-    writer.write_all(b") ")
+    writer.write_all(b")")
 }
 
 #[allow(non_snake_case)]
@@ -725,6 +811,100 @@ pub fn write_cuMemMapArrayAsync_ptsz(
     write_cuMemMapArrayAsync(writer, mapInfoList, count, hStream)
 }
 
+#[allow(non_snake_case)]
+pub fn write_cuLinkCreate_v2(
+    writer: &mut (impl std::io::Write + ?Sized),
+    numOptions: ::std::os::raw::c_uint,
+    options: *mut CUjit_option,
+    optionValues: *mut *mut ::std::os::raw::c_void,
+    stateOut: *mut CUlinkState,
+) -> std::io::Result<()> {
+    writer.write_all(b"(numOptions: ")?;
+    CudaDisplay::write(&numOptions, "cuLinkCreate_v2", 0, writer)?;
+    writer.write_all(b", options: ")?;
+    write_array("cuLinkCreate_v2", 1, writer, numOptions, options)?;
+    writer.write_all(b", optionValues: ")?;
+    write_array("cuLinkCreate_v2", 2, writer, numOptions, optionValues)?;
+    writer.write_all(b", stateOut: ")?;
+    CudaDisplay::write(&stateOut, "cuLinkCreate_v2", 3, writer)?;
+    writer.write_all(b")")
+}
+
+#[allow(non_snake_case)]
+pub fn write_cuLinkAddData_v2(
+    writer: &mut (impl std::io::Write + ?Sized),
+    state: CUlinkState,
+    type_: CUjitInputType,
+    data: *mut ::std::os::raw::c_void,
+    size: usize,
+    name: *const ::std::os::raw::c_char,
+    numOptions: ::std::os::raw::c_uint,
+    options: *mut CUjit_option,
+    optionValues: *mut *mut ::std::os::raw::c_void,
+) -> std::io::Result<()> {
+    writer.write_all(b"(state: ")?;
+    CudaDisplay::write(&state, "cuLinkAddData_v2", 0, writer)?;
+    writer.write_all(b", type: ")?;
+    CudaDisplay::write(&type_, "cuLinkAddData_v2", 1, writer)?;
+    writer.write_all(b", data: ")?;
+    CudaDisplay::write(&data, "cuLinkAddData_v2", 2, writer)?;
+    writer.write_all(b", size: ")?;
+    CudaDisplay::write(&size, "cuLinkAddData_v2", 3, writer)?;
+    writer.write_all(b", name: ")?;
+    CudaDisplay::write(&name, "cuLinkAddData_v2", 4, writer)?;
+    writer.write_all(b", numOptions: ")?;
+    CudaDisplay::write(&numOptions, "cuLinkAddData_v2", 5, writer)?;
+    writer.write_all(b", options: ")?;
+    write_array("cuLinkAddData_v2", 6, writer, numOptions, options)?;
+    writer.write_all(b", optionValues: ")?;
+    write_array("cuLinkAddData_v2", 7, writer, numOptions, optionValues)?;
+    writer.write_all(b")")
+}
+
+#[allow(non_snake_case)]
+pub fn write_cuModuleLoadDataEx(
+    writer: &mut (impl std::io::Write + ?Sized),
+    module: *mut CUmodule,
+    image: *const ::std::os::raw::c_void,
+    numOptions: ::std::os::raw::c_uint,
+    options: *mut CUjit_option,
+    optionValues: *mut *mut ::std::os::raw::c_void,
+) -> std::io::Result<()> {
+    writer.write_all(b"(module: ")?;
+    CudaDisplay::write(&module, "cuModuleLoadDataEx", 0, writer)?;
+    writer.write_all(b", image: ")?;
+    CudaDisplay::write(&image, "cuModuleLoadDataEx", 1, writer)?;
+    writer.write_all(b", numOptions: ")?;
+    CudaDisplay::write(&numOptions, "cuModuleLoadDataEx", 2, writer)?;
+    writer.write_all(b", options: ")?;
+    write_array("cuModuleLoadDataEx", 3, writer, numOptions, options)?;
+    writer.write_all(b", optionValues: ")?;
+    write_array("cuModuleLoadDataEx", 4, writer, numOptions, optionValues)?;
+    writer.write_all(b")")
+}
+
+fn write_array<T: CudaDisplay>(
+    fn_name: &'static str,
+    index: usize,
+    writer: &mut (impl std::io::Write + ?Sized),
+    length: u32,
+    values: *mut T,
+) -> std::io::Result<()> {
+    let length = length as usize;
+    if length < 2 {
+        CudaDisplay::write(&values, fn_name, index, writer)
+    } else {
+        writer.write_all(b"[")?;
+        for i in 0..length {
+            CudaDisplay::write(&unsafe { values.add(i) }, fn_name, index, writer)?;
+            if i != length - 1 {
+                writer.write_all(b", ")?;
+            }
+        }
+        writer.write_all(b"]")
+    }
+}
+
 cuda_derive_display_trait!(
     cuda_types,
     CudaDisplay,
@@ -737,7 +917,9 @@ cuda_derive_display_trait!(
         CUstreamBatchMemOpParams_union_CUstreamMemOpWaitValueParams_st,
         CUstreamBatchMemOpParams_union_CUstreamMemOpWriteValueParams_st,
         CUuuid_st,
-        HGPUNV
+        HGPUNV,
+        CUgraphNodeParams_st,
+        CUlaunchAttribute_st
     ],
     [
         cuCtxCreate_v3,
@@ -750,6 +932,30 @@ cuda_derive_display_trait!(
         cuStreamGetAttribute,
         cuStreamGetAttribute_ptsz,
         cuStreamSetAttribute,
-        cuStreamSetAttribute_ptsz
+        cuStreamSetAttribute_ptsz,
+        cuLinkCreate_v2,
+        cuLinkAddData_v2,
+        cuModuleLoadDataEx,
     ]
 );
+
+#[cfg(test)]
+
+mod tests {
+    use cuda_types::CUuuid;
+
+    use super::CudaDisplay;
+
+    #[test]
+    fn guid_formats_correctly() {
+        let cuid = CUuuid {
+            bytes: [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
+            ],
+        };
+        let mut writer = String::new();
+        CudaDisplay::write(&cuid, "", 0, unsafe { writer.as_mut_vec() }).unwrap();
+        assert_eq!(writer, "{04030201-0605-0807-090a-0b0c0d0e0f10}");
+    }
+}
